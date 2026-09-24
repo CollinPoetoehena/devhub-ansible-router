@@ -1,0 +1,148 @@
+# {{ ansible_managed }}
+#
+# dnsmasq configuration for the lab router.
+# This file is managed by Ansible — do not edit manually.
+#
+# dnsmasq provides two services on the lab network:
+#   1. DHCP server: automatically assigns IP addresses to lab devices
+#   2. DNS server: resolves domain names for lab devices (forwarding to upstream
+#      DNS for internet domains, and resolving local hostnames from DHCP leases)
+#
+# See for details on the network design and used variables, such as the LAN subnet, 
+# DHCP range, and static leases, etc., an example in my homelab documentation (can be 
+# used as a reference): https://github.com/CollinPoetoehena/DevHub/blob/main/homelab/docs/1_Design/2_Design_Network.md 
+
+################################################################################
+# Interface binding:
+# Explicitly bind dnsmasq only to the LAN interfaces (the VLAN sub-interfaces) and 
+# exclude lo interface, so that DNS queries must be sent to the router's LAN IPs of 
+# the VLAN sub-interfaces (e.g., 10.42.10.1) instead of 127.0.0.1 (localhost). This is 
+# intentional: binding only to the LAN interface prevents dnsmasq from answering DNS or 
+# DHCP requests on unintended interfaces (like WAN (breaking the home network because it 
+# conflicts with the ISP modem) or localhost), which keeps the router safe and avoids 
+# conflicts with other local DNS services. As a result, DNS queries must be sent to the 
+# router's LAN IPs of the VLAN sub-interfaces (e.g., 10.42.10.1) instead of 127.0.0.1.
+################################################################################
+# Only listen on VLAN sub-interfaces. NEVER serve DHCP or DNS on the WAN
+# interface (eth0) — doing so would conflict with the ISP modem and break the
+# home network for everyone in the house.
+{% for vlan in router_vlans %}
+interface={{ vlan.interface }}
+{% endfor %}
+
+# Exclude loopback: dnsmasq implicitly includes lo even when interface= is set.
+# If anything else listens on 127.0.0.1:53 (e.g. systemd-resolved stub), dnsmasq
+# fails with "Address already in use". The router only needs DNS/DHCP on the 
+# LAN interfaces (the VLAN sub-interfaces), as explained above.
+except-interface=lo
+
+# This is an extra safety measure in addition to the "interface" directive above. 
+# bind-interfaces or bind-dynamic ensures dnsmasq only binds to the specified interface, 
+# not all interfaces.
+# bind-dynamic is a safer alternative to bind-interfaces. Both prevent dnsmasq
+# from listening on all interfaces (which would serve DHCP on the WAN side and
+# break the home network). The difference:
+#   bind-interfaces: binds at startup and never re-checks. If eth1 does not
+#     have its static IP yet when dnsmasq starts (race condition with
+#     NetworkManager), dnsmasq silently skips it and never serves DHCP — devices
+#     connected to the LAN get no IP address at all.
+#   bind-dynamic: re-checks interfaces periodically and picks up eth1 once
+#     NetworkManager assigns the static IP, even if that happens after dnsmasq
+#     has already started.
+#
+# This was the root cause of a previous issue where a laptop connected to eth1.x
+# did not receive a DHCP address until it generated traffic (e.g. ping). The
+# DHCP handshake was delayed because dnsmasq had not bound to eth1 at startup.
+# Therefore, the bind-dynamic option is used to avoid this race condition and ensure
+# that dnsmasq always serves DHCP on the LAN interface, even if it starts before
+# NetworkManager assigns the static IP to eth1.
+bind-dynamic
+
+################################################################################
+# Upstream DNS servers
+################################################################################
+# These are the DNS servers that dnsmasq forwards queries to when it cannot
+# resolve a name locally (i.e. for internet domain names like google.com).
+# dnsmasq queries them in order and uses whichever responds fastest.
+{% for dns_server in router_dns_upstream_servers %}
+server={{ dns_server }}
+{% endfor %}
+
+# Do not read /etc/resolv.conf for upstream DNS servers.
+# We explicitly define them below so the configuration is fully self-contained
+# and not affected by DHCP-provided DNS from the ISP modem.
+no-resolv
+
+################################################################################
+# DNS settings
+################################################################################
+# Cache DNS responses to speed up repeated lookups. A cache size of
+# {{ router_dns_cache_size }} entries is plenty for a small homelab.
+cache-size={{ router_dns_cache_size }}
+
+# Domain for the lab network. DHCP clients are given this as their search domain,
+# so "ping pve1" resolves to "pve1.{{ router_dhcp_domain }}".
+domain={{ router_dhcp_domain }}
+
+# Automatically add the domain to simple hostnames from DHCP.
+# When a device named "pve1" gets a DHCP lease, dnsmasq creates a DNS entry
+# for both "pve1" and "pve1.{{ router_dhcp_domain }}".
+expand-hosts
+
+################################################################################
+# DHCP configuration
+################################################################################
+# Mark dnsmasq as the only DHCP server on this network. Without this, dnsmasq
+# is conservative: it waits longer before responding to DHCPDISCOVER and won't
+# NAK unknown leases (from a previous server). The result is that new devices
+# can take 30+ seconds to get an IP, or may not get one until they generate
+# traffic. With dhcp-authoritative, dnsmasq replies immediately and NAKs stale
+# leases so clients retry and get a fresh address quickly.
+dhcp-authoritative
+
+# Define per-VLAN DHCP ranges. Each VLAN sub-interface has its own IP range.
+# dnsmasq matches requests to the correct range based on the receiving interface's
+# subnet. Tags (set:vlanXX) allow per-VLAN gateway and DNS options below.
+#
+# Addresses below dhcp_range_start (e.g. .1–.99) are reserved for static
+# assignments (router, switches, servers with fixed IPs).
+{% for vlan in router_vlans %}
+dhcp-range=set:vlan{{ vlan.id }},{{ vlan.dhcp_range_start }},{{ vlan.dhcp_range_end }},{{ vlan.netmask }},{{ router_dhcp_lease_time }}
+{% endfor %}
+
+# Tell DHCP clients which gateway and DNS server to use (per VLAN).
+# Option 3 = router/gateway, Option 6 = DNS server.
+{% for vlan in router_vlans %}
+dhcp-option=tag:vlan{{ vlan.id }},3,{{ vlan.gateway_ip }}
+dhcp-option=tag:vlan{{ vlan.id }},6,{{ vlan.gateway_ip }}
+{% endfor %}
+
+################################################################################
+# Static DHCP leases (MAC → IP reservations)
+################################################################################
+# Devices that need a fixed IP address regardless of DHCP order.
+# Useful for servers (Proxmox hosts, k8s nodes) that other devices need to
+# reach at a known address.
+{% if router_static_leases | length > 0 %}
+{% for lease in router_static_leases %}
+# {{ lease.hostname }}
+dhcp-host={{ lease.mac }},{{ lease.ip }},{{ lease.hostname }}
+{% endfor %}
+{% else %}
+# No static leases defined. Add them in router_static_leases variable. Example:
+#   router_static_leases:
+#     - { mac: "aa:bb:cc:dd:ee:01", ip: "10.42.10.2", hostname: "lab-switch" }
+#     - { mac: "aa:bb:cc:dd:ee:02", ip: "10.42.10.10", hostname: "pve1" }
+#     - { mac: "aa:bb:cc:dd:ee:03", ip: "10.42.10.11", hostname: "pve2" }
+{% endif %}
+
+################################################################################
+# Logging
+################################################################################
+# Log DHCP transactions (leases, renewals, releases) for troubleshooting.
+# Logs go to syslog (/var/log/syslog on Raspberry Pi OS) by default.
+log-dhcp
+
+# Log DNS queries (useful for debugging but can be verbose in production).
+# Uncomment the line below if you need to debug DNS resolution issues:
+# log-queries

@@ -1,0 +1,41 @@
+---
+# tasks file for devhub-ansible-router
+#
+# This role configures a Raspberry Pi as a dedicated lab router.
+# It provides:
+#   - Static IP on the LAN interface and IP forwarding (networking)
+#   - DHCP and DNS services for lab devices (dnsmasq)
+#   - NAT (masquerading) so lab devices can reach the internet (firewall)
+#   - Firewall rules to isolate the lab from the home network (firewall)
+#
+# The tasks are split into separate files for clarity and maintainability.
+# Order matters: networking must be configured before DHCP/DNS (dnsmasq needs
+# the LAN interface to have an IP), and firewall rules depend on both interfaces
+# being properly configured.
+
+- name: Install utility packages
+  ansible.builtin.import_tasks: packages.yml
+  tags: [packages, router]
+
+- name: Configure network interfaces and IP forwarding
+  ansible.builtin.import_tasks: networking.yml
+  tags: [networking, router]
+
+- name: Configure DHCP and DNS (dnsmasq)
+  ansible.builtin.import_tasks: dhcp_dns.yml
+  tags: [dhcp, dns, dnsmasq, router]
+
+- name: Configure firewall, NAT, and security rules
+  ansible.builtin.import_tasks: firewall.yml
+  tags: [firewall, nat, router]
+
+# Flush handlers before verification so that any pending restarts (e.g. dnsmasq
+# config change) are applied first. Without this, verify runs against the old
+# state and a failure aborts the play before handlers ever fire.
+- name: Flush pending handlers before verification
+  ansible.builtin.meta: flush_handlers
+  tags: [router]
+
+- name: Verify router setup
+  ansible.builtin.import_tasks: verify.yml
+  tags: [verify, router]

@@ -1,0 +1,150 @@
+---
+# networking.yml — Configure the Pi's network interfaces and IP forwarding.
+#
+# This task file handles the foundational networking setup that turns the Pi
+# into a router:
+#   1. Ensure the physical LAN interface (eth1) is up with no IP (native VLAN
+#      is unused for production traffic).
+#   2. Create VLAN sub-interfaces (eth1.10, eth1.20, eth1.30) with static IPs
+#      so each VLAN has a predictable gateway address.
+#   3. Enable IPv4 forwarding in the kernel so packets can flow between the
+#      WAN (eth0) and VLAN sub-interfaces.
+#
+# Without these steps, the Pi is just a regular host — it cannot route
+# traffic between VLANs or to the internet.
+
+################################################################################
+# WAN Interface (eth0) — DHCP, rename auto-created profile
+################################################################################
+# NetworkManager auto-creates "Wired connection 1" for eth0. Rename it to something meaningful so `nmcli connection show` is readable.
+# Functionally this does not change anything, however it improves readability and management of  the network connections
+# (e.g. can distinguish between WAN and LAN interfaces, etc.). So, this is still an important step to perform!
+
+- name: Find current NM connection name for WAN interface ({{ router_wan_interface }})
+  ansible.builtin.command:
+    cmd: "nmcli -t -f NAME,DEVICE connection show --active"
+  register: wan_conn_check
+  changed_when: false
+
+- name: Rename WAN connection to {{ router_wan_connection_name }}
+  ansible.builtin.command:
+    cmd: >-
+      nmcli connection modify "{{ item.split(':')[0] }}"
+      connection.id "{{ router_wan_connection_name }}"
+  loop: "{{ wan_conn_check.stdout_lines }}"
+  when:
+    - item.split(':')[1] == router_wan_interface
+    - item.split(':')[0] != router_wan_connection_name
+  changed_when: true
+
+################################################################################
+# Physical LAN Interface (eth1) — no IP, just link up
+################################################################################
+# The physical eth1 interface must be up for VLAN sub-interfaces to work,
+# but carries no production traffic (native VLAN 1 is unused).
+# See TODO.md for why it is unused.
+#
+# The WAN interface (eth0) is left as DHCP — it gets its IP from the ISP modem.
+#
+# The community.general.nmcli module is idempotent: it creates the connection
+# on first run and only modifies it if parameters change on subsequent runs.
+#
+# NOTE: # NetworkManager is the network daemon on Raspberry Pi OS (Trixie/Debian 13+).
+# older Raspberry Pi OS versions used dhcpcd instead of NetworkManager.
+# If your Pi uses dhcpcd, configure the static IP in /etc/dhcpcd.conf instead.
+
+- name: Check if LAN connection profile already exists
+  ansible.builtin.command:
+    cmd: "nmcli -t -f ipv4.addresses connection show {{ router_lan_connection_name }}"
+  register: lan_conn_check
+  changed_when: false
+  failed_when: false
+
+# If migrating from the old single-IP config (no VLANs, only the physical LAN interface with a
+# static IP (eth1)), the existing profile has ipv4.addresses set.
+# NM rejects method=disabled with addresses present, and rejects clearing addresses while method=manual. Must set both atomically.
+- name: Clear stale IPv4 address on LAN connection (migration from old config)
+  ansible.builtin.command:
+    cmd: "nmcli connection modify {{ router_lan_connection_name }} ipv4.method disabled ipv4.addresses ''"
+  when: lan_conn_check.rc == 0 and lan_conn_check.stdout | trim != ''
+  changed_when: true
+
+- name: Ensure physical LAN interface ({{ router_lan_interface }}) is up with no IP
+  community.general.nmcli: # https://docs.ansible.com/projects/ansible/latest/collections/community/general/nmcli_module.html
+    conn_name: "{{ router_lan_connection_name }}"
+    ifname: "{{ router_lan_interface }}"
+    type: ethernet # Physical Ethernet connection (not VLAN)
+    method4: disabled # No IPv4 — native VLAN 1 carries no production traffic
+    method6: disabled # No IPv6 — lab is IPv4-only
+    autoconnect: true # Bring up automatically on boot / cable insert
+    state: present # Create or update the NM profile (idempotent)
+  notify: Activate LAN connection
+
+################################################################################
+# VLAN Sub-Interfaces
+################################################################################
+# Create a VLAN sub-interface for each VLAN defined in router_vlans.
+# Each sub-interface gets a static IP (the gateway for that VLAN).
+#
+# The community.general.nmcli module is idempotent: it creates the connection
+# on first run and only modifies it if parameters change on subsequent runs.
+
+- name: Create VLAN sub-interfaces
+  community.general.nmcli:
+    conn_name: "vlan-{{ item.name | lower }}" # NM profile name (e.g. "vlan-management")
+    ifname: "{{ item.interface }}" # Kernel interface name (e.g. "eth1.10")
+    type: vlan # 802.1Q VLAN sub-interface — creates a virtual interface (e.g. eth1.20@eth1) that tags/untags Ethernet frames with the VLAN ID on the parent interface
+    vlanid: "{{ item.id }}" # VLAN tag ID (e.g. 10)
+    vlandev: "{{ router_lan_interface }}" # Parent physical interface (eth1)
+    ip4: "{{ item.gateway_ip }}/{{ item.cidr }}" # Static gateway IP for this VLAN
+    method4: manual # Static IPv4 (not DHCP) — the router IS the gateway
+    method6: disabled # No IPv6 — lab is IPv4-only
+    autoconnect: true
+    state: present
+  loop: "{{ router_vlans }}"
+  loop_control:
+    label: "{{ item.interface }} ({{ item.name }})"
+  notify: Activate VLAN connections
+
+# NetworkManager auto-creates "Wired connection N" profiles for detected
+# interfaces. These conflict with our managed profile and can cause the
+# interface to get DHCP instead of the static IP. Remove any auto-created
+# connection for the LAN interface, keeping only our managed one.
+- name: Check for auto-created connections on LAN interface
+  ansible.builtin.command:
+    cmd: "nmcli -t -f NAME,DEVICE,UUID connection show"
+  register: nm_connections
+  changed_when: false
+
+- name: Remove auto-created connections for LAN interface
+  ansible.builtin.command:
+    cmd: "nmcli connection delete '{{ item.split(':')[0] }}'"
+  loop: "{{ nm_connections.stdout_lines }}"
+  when: >
+    item.split(':')[0] != router_lan_connection_name and
+    (item.split(':')[1] == router_lan_interface or
+     (item.split(':')[1] == '--' and 'Wired connection' in item.split(':')[0] and item.split(':')[0] != 'Wired connection 1'))
+  changed_when: true
+
+################################################################################
+# IP Forwarding
+################################################################################
+# By default, the Linux kernel does NOT forward packets between interfaces.
+# Enabling ip_forward tells the kernel to act as a router: packets arriving on
+# one interface (e.g. eth1 from a lab device) can be forwarded out another
+# interface (e.g. eth0 towards the internet), and vice versa.
+#
+# Without this, lab devices can reach the Pi itself but cannot get to the
+# internet or any other network — their packets just stop at the Pi.
+
+- name: Enable IPv4 forwarding (persist across reboots)
+  ansible.builtin.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+    # Write to a dedicated file in /etc/sysctl.d/ with high sort order (99-).
+    # The default target (/etc/sysctl.conf) can be overridden by files in
+    # /etc/sysctl.d/ that load later, silently resetting ip_forward to 0.
+    sysctl_file: /etc/sysctl.d/99-router-ip-forward.conf

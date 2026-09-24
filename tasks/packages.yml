@@ -1,0 +1,18 @@
+---
+# packages.yml — Install utility packages for router administration and debugging.
+
+- name: Install utility packages
+  ansible.builtin.apt:
+    name:
+      - dnsutils # nslookup, dig — DNS debugging
+      - tcpdump # packet capture for network debugging (https://www.tcpdump.org/index.html)
+      - tshark # CLI Wireshark — deep packet inspection and protocol analysis (https://tshark.dev/)
+      - curl # HTTP testing
+      - nmap # network scanner — port scanning and host discovery
+      - netcat-openbsd # nc — TCP/UDP connection testing and port listening
+      - traceroute # trace packet route to destination
+      - mtr-tiny # combined traceroute and ping with continuous stats
+      - iperf3 # network bandwidth and throughput testing
+      - iputils-ping # ping — ICMP connectivity checks
+    state: present
+    update_cache: true

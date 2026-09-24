@@ -1,0 +1,298 @@
+---
+# firewall.yml — Configure iptables for NAT, forwarding, and security rules.
+#
+# This task file sets up the firewall rules that make the Pi function as a
+# proper router with network address translation (NAT) and security isolation.
+#
+# What NAT (Network Address Translation) does:
+#   Lab devices have private IPs (10.42.0.0/20) that are not routable on the
+#   internet or even on the home network. NAT (specifically MASQUERADE) rewrites
+#   the source IP of outgoing packets from lab devices to the Pi's WAN IP
+#   (e.g. 192.168.2.x). This makes it look like all lab traffic comes from the Pi
+#   itself, allowing lab devices to access the internet through the ISP modem.
+#   Return traffic is automatically translated back to the original lab device IP.
+#
+# What the FORWARD chain does:
+#   The FORWARD chain controls which packets are allowed to pass THROUGH the Pi
+#   (from one interface to another). Without explicit FORWARD rules, the kernel
+#   drops forwarded packets even if ip_forward is enabled, because the default
+#   policy is typically DROP or the chain is empty.
+#
+# Security isolation (lab → home blocking):
+#   Even though NAT allows lab devices to reach the internet, we add explicit
+#   rules to BLOCK lab devices from reaching the HOME network (e.g. 192.168.2.0/24).
+#
+# Inter-VLAN isolation:
+#   By default, inter-VLAN traffic is allowed (the router forwards between all
+#   VLAN sub-interfaces). Specific rules block dangerous flows, e.g. IoT → Management.
+#
+# Rule order matters! iptables processes rules top-to-bottom and stops at the
+# first match. The blocking rule for home network traffic must come BEFORE the
+# general allow rule for internet traffic.
+
+################################################################################
+# Derived variables
+################################################################################
+# iptables "-i eth1+" matches the physical interface AND all VLAN sub-interfaces
+# (eth1.10, eth1.20, eth1.30). The "+" is an iptables wildcard meaning "any
+# interface whose name starts with this prefix". This lets us write one rule
+# that covers all VLANs instead of duplicating per sub-interface.
+- name: Set LAN wildcard interface for iptables rules
+  ansible.builtin.set_fact:
+    router_lan_wildcard: "{{ router_lan_interface }}+"
+
+################################################################################
+# Install iptables and persistence tooling
+################################################################################
+
+- name: Install iptables and iptables-persistent
+  ansible.builtin.apt:
+    name:
+      - iptables
+      - iptables-persistent
+    state: present
+    update_cache: true
+  # iptables-persistent asks interactive questions during install about saving
+  # current rules. Pre-seed the answers to avoid blocking the playbook.
+  environment:
+    DEBIAN_FRONTEND: noninteractive
+
+# Pre-seed debconf answers for iptables-persistent so it does not prompt
+# during installation. This tells it to save current rules automatically.
+- name: Pre-seed iptables-persistent debconf answers
+  ansible.builtin.debconf:
+    name: iptables-persistent
+    question: "{{ item }}"
+    value: "true"
+    vtype: boolean
+  loop:
+    - iptables-persistent/autosave_v4
+    - iptables-persistent/autosave_v6
+
+################################################################################
+# NAT (Masquerading) — Allow lab devices to reach the internet
+################################################################################
+# MASQUERADE in the POSTROUTING chain of the nat table rewrites the source IP
+# of packets leaving via eth0 (WAN) to the Pi's own WAN IP. This is what
+# enables internet access for all lab devices behind the router.
+#
+# Why MASQUERADE instead of SNAT?
+#   MASQUERADE automatically uses whatever IP is currently assigned to the
+#   outgoing interface (eth0). Since eth0 gets its IP via DHCP from the ISP
+#   modem (and it could theoretically change), MASQUERADE adapts automatically.
+#   SNAT requires a hard-coded IP and would break if the DHCP lease changes.
+
+- name: Configure NAT (MASQUERADE) on WAN interface
+  ansible.builtin.iptables:
+    table: nat # The "nat" table handles address translation (separate from the default "filter" table)
+    chain: POSTROUTING # POSTROUTING = after routing decision, just before packet leaves the interface
+    out_interface: "{{ router_wan_interface }}" # Only rewrite packets exiting via WAN (eth0)
+    jump: MASQUERADE # Replace source IP with the WAN interface's current IP
+    comment: "NAT: masquerade lab traffic going out to internet via WAN"
+  when: router_enable_nat
+  notify: Save iptables rules
+
+################################################################################
+# FORWARD chain — Control traffic flow between interfaces
+################################################################################
+# These rules define what traffic is allowed to pass through the Pi (be routed
+# from one interface to another).
+
+# RULE 1: Block lab → home network (MUST come before the general allow rule!)
+# This prevents any lab device from initiating connections to the home network.
+# Even though the Pi does NAT, without this rule a lab device could potentially
+# reach home devices if the ISP modem routes 10.42.x.x traffic back.
+# This is defense-in-depth: even if something goes wrong with NAT or routing,
+# the firewall explicitly blocks this traffic.
+- name: Block lab network from reaching home network
+  ansible.builtin.iptables:
+    chain: FORWARD # FORWARD = packets passing THROUGH the router (not destined for the router itself)
+    in_interface: "{{ router_lan_wildcard }}" # Match traffic arriving from any lab VLAN
+    destination: "{{ router_home_subnet }}" # Headed for the home network
+    jump: DROP # Silently discard — no response sent back
+    comment: "SECURITY: block lab devices from reaching home network"
+  when: router_block_lab_to_home
+  notify: Save iptables rules
+
+# RULE 2: Allow lab → internet (outbound from LAN to WAN)
+# This allows lab devices to initiate connections to the internet (any
+# destination that is NOT the home network, since that's blocked above).
+- name: Allow forwarding from LAN to WAN (lab → internet)
+  ansible.builtin.iptables:
+    chain: FORWARD # Packets passing through the router
+    in_interface: "{{ router_lan_wildcard }}" # From any lab VLAN
+    out_interface: "{{ router_wan_interface }}" # Heading to the internet via WAN
+    jump: ACCEPT # Allow the packet through
+    comment: "Allow lab devices to reach the internet via WAN"
+  notify: Save iptables rules
+
+################################################################################
+# RULE 3 + RULE 3b — WAN → LAN/VLAN return traffic handling and WAN isolation
+#
+# These two rules together define how the router handles traffic coming *from*
+# the WAN (home network) toward the LAN/VLANs (lab network). They ensure that:
+#   1. Lab devices can receive return traffic from the internet (ESTABLISHED,
+#      RELATED connections only).
+#   2. The router NEVER forwards any *new* traffic from the home network into
+#      the lab VLANs — providing strong isolation and preventing accidental
+#      disruption of the home network.
+#
+# Why this matters:
+#   - Linux forwarding is global (ip_forward=1), so iptables must enforce
+#     interface-level forwarding rules.
+#   - Without RULE 3, lab devices could reach the internet but never receive
+#     responses.
+#   - Without RULE 3b, future firewall changes could accidentally allow WAN →
+#     LAN/VLAN forwarding, which risks: DHCP conflicts, ARP pollution, Broadcast storms,
+#     Routing loops, NAT misfires, Accidental bridging between home and lab networks, etc.
+#
+# Together, these rules form a hard safety barrier:
+#   - LAN/VLAN → WAN is allowed (internet access)
+#   - WAN → LAN/VLAN is allowed ONLY for ESTABLISHED/RELATED return traffic
+#   - All NEW WAN → LAN/VLAN forwarding is explicitly blocked
+#
+# This guarantees the Pi router cannot disrupt home WiFi, home DHCP, or home
+# routing — even if NetworkManager or iptables rules are modified later.
+################################################################################
+# RULE 3: Allow return traffic (WAN → LAN for established connections)
+# This allows response packets from the internet back to lab devices, but ONLY
+# for connections that were initiated from the lab side (RELATED,ESTABLISHED).
+- name: Allow return traffic from WAN to LAN (established/related connections only)
+  ansible.builtin.iptables:
+    chain: FORWARD
+    in_interface: "{{ router_wan_interface }}"    # Traffic entering from WAN (home network)
+    out_interface: "{{ router_lan_wildcard }}"    # Any lab VLAN (eth1+ wildcard)
+    ctstate: # conntrack state — only allow packets belonging to
+      - ESTABLISHED # an existing connection (response to outbound request)
+      - RELATED # or related to one (e.g. ICMP error for an active conn)
+    jump: ACCEPT
+    comment: "Allow return traffic for connections initiated by lab devices"
+  notify: Save iptables rules
+# RULE 3b: Explicitly block any NEW forwarding from WAN → LAN/VLANs
+- name: Explicitly block WAN → LAN/VLAN forwarding
+  ansible.builtin.iptables:
+    chain: FORWARD
+    in_interface: "{{ router_wan_interface }}"     # Traffic entering from WAN (home network)
+    out_interface: "{{ router_lan_wildcard }}"     # Any lab VLAN (eth1+ wildcard)
+    jump: DROP                                     # Block NEW forwarding attempts
+    comment: "SECURITY: explicitly block WAN → LAN/VLAN forwarding (defense-in-depth)"
+  notify: Save iptables rules
+
+# RULE 4: Allow inter-VLAN forwarding (traffic between VLAN sub-interfaces)
+# The router forwards between all VLANs by default. Specific deny rules below
+# restrict dangerous flows (e.g. IoT → Management).
+- name: Allow inter-VLAN forwarding
+  ansible.builtin.iptables:
+    chain: FORWARD
+    in_interface: "{{ router_lan_wildcard }}" # From any lab VLAN sub-interface
+    out_interface: "{{ router_lan_wildcard }}" # To any lab VLAN sub-interface
+    jump: ACCEPT
+    comment: "Allow inter-VLAN routing between lab VLANs"
+  notify: Save iptables rules
+
+# TODO: Add specific inter-VLAN deny rules once IoT VLAN is populated, e.g.:
+#   - Block IoT (eth1.30) → Management (eth1.10)
+#   - Allow IoT (eth1.30) → Services (eth1.20) for sensor data
+
+################################################################################
+# INPUT chain — Protect the router itself
+################################################################################
+# INPUT controls traffic destined for the Pi itself (its own services: SSH,
+# DNS, DHCP). This is separate from FORWARD which handles traffic passing
+# through the router to other networks.
+
+# Allow all traffic on loopback (required for local services to communicate)
+- name: Allow loopback traffic
+  ansible.builtin.iptables:
+    chain: INPUT # Packets destined for the router itself
+    in_interface: lo # Loopback interface (127.0.0.1)
+    jump: ACCEPT
+    comment: "Allow loopback traffic (required for local services)"
+  notify: Save iptables rules
+
+# Allow established/related traffic to the router itself (responses to
+# outgoing connections the Pi initiated, e.g. apt updates, DNS queries)
+- name: Allow established/related traffic to router
+  ansible.builtin.iptables:
+    chain: INPUT
+    ctstate:
+      - ESTABLISHED
+      - RELATED
+    jump: ACCEPT
+    comment: "Allow return traffic for router's own connections"
+  notify: Save iptables rules
+
+# Allow SSH from LAN side (so you can manage the router from lab devices)
+- name: Allow SSH from LAN
+  ansible.builtin.iptables:
+    chain: INPUT
+    in_interface: "{{ router_lan_wildcard }}" # From any lab VLAN
+    protocol: tcp # SSH uses TCP
+    destination_port: "22" # Standard SSH port
+    jump: ACCEPT
+    comment: "Allow SSH access from lab network"
+  notify: Save iptables rules
+
+# Allow SSH from WAN side (so you can manage the router from home network/laptop)
+- name: Allow SSH from WAN
+  ansible.builtin.iptables:
+    chain: INPUT
+    in_interface: "{{ router_wan_interface }}" # From the home network side
+    protocol: tcp
+    destination_port: "22"
+    jump: ACCEPT
+    comment: "Allow SSH access from home network"
+  notify: Save iptables rules
+
+# Allow DHCP requests on LAN (lab devices requesting IP addresses)
+- name: Allow DHCP on LAN interface
+  ansible.builtin.iptables:
+    chain: INPUT
+    in_interface: "{{ router_lan_wildcard }}"
+    protocol: udp # DHCP uses UDP
+    destination_port: "67" # Port 67 = DHCP server; clients send from port 68
+    jump: ACCEPT
+    comment: "Allow DHCP requests from lab devices"
+  notify: Save iptables rules
+
+# Allow DNS queries on LAN (lab devices resolving domain names via dnsmasq)
+- name: Allow DNS (UDP) on LAN interface
+  ansible.builtin.iptables:
+    chain: INPUT
+    in_interface: "{{ router_lan_wildcard }}"
+    protocol: udp
+    destination_port: "53" # DNS uses port 53 for both UDP (most queries) and TCP (zone transfers, large responses)
+    jump: ACCEPT
+    comment: "Allow DNS queries (UDP) from lab devices"
+  notify: Save iptables rules
+
+- name: Allow DNS (TCP) on LAN interface
+  ansible.builtin.iptables:
+    chain: INPUT
+    in_interface: "{{ router_lan_wildcard }}"
+    protocol: tcp
+    destination_port: "53"
+    jump: ACCEPT
+    comment: "Allow DNS queries (TCP) from lab devices"
+  notify: Save iptables rules
+
+# Allow ICMP (ping) — useful for network troubleshooting and monitoring
+- name: Allow ICMP (ping) from anywhere
+  ansible.builtin.iptables:
+    chain: INPUT
+    protocol: icmp # ICMP = Internet Control Message Protocol (ping, traceroute, etc.)
+    jump: ACCEPT
+    comment: "Allow ping for network troubleshooting"
+  notify: Save iptables rules
+
+################################################################################
+# Save rules for persistence across reboots
+################################################################################
+# iptables rules are stored in memory and lost on reboot unless explicitly saved.
+# netfilter-persistent saves them to /etc/iptables/rules.v4 and loads them at boot.
+
+- name: Save iptables rules to persist across reboots
+  ansible.builtin.command:
+    cmd: netfilter-persistent save
+  changed_when: true
+  when: router_iptables_persistent

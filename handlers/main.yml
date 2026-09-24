@@ -1,0 +1,38 @@
+---
+# handlers file for devhub-ansible-router
+#
+# Handlers are triggered by "notify" in tasks and run once at the end of the play
+# (or when explicitly flushed). They ensure services are restarted/reloaded only
+# when their configuration has actually changed, avoiding unnecessary restarts.
+
+# Bring up (or restart) the LAN NetworkManager connection after the static IP
+# is created or modified. This applies the new IP to the interface immediately
+# without waiting for a reboot.
+- name: Activate LAN connection
+  ansible.builtin.command:
+    cmd: "nmcli connection up {{ router_lan_connection_name }}"
+  changed_when: true
+
+# Bring up VLAN sub-interface connections after they are created or modified.
+- name: Activate VLAN connections
+  ansible.builtin.command:
+    cmd: "nmcli connection up vlan-{{ item.name | lower }}"
+  loop: "{{ router_vlans }}"
+  loop_control:
+    label: "{{ item.interface }}"
+  changed_when: true
+
+# Restart dnsmasq when its configuration file changes.
+# This applies new DHCP ranges, DNS settings, static leases, etc.
+- name: Restart dnsmasq
+  ansible.builtin.service:
+    name: dnsmasq
+    state: restarted
+
+# Save iptables rules to disk so they persist across reboots.
+# Without this, any rule changes would be lost on the next reboot.
+# netfilter-persistent saves to /etc/iptables/rules.v4 (and rules.v6).
+- name: Save iptables rules
+  ansible.builtin.command:
+    cmd: netfilter-persistent save
+  changed_when: true

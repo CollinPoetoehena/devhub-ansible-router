@@ -1,0 +1,122 @@
+---
+# defaults file for devhub-ansible-router
+#
+# Generic defaults that work for any deployment. Site-specific values
+# (network addressing, home subnet, DHCP range, per-VLAN firewall policy)
+# MUST be set in group_vars/router/ or host_vars/.
+#
+################################################################################
+# Reference: Where to find these variables and documentation:
+# This role is generic, but it is mainly used for my homelab for which I can find
+# the documentation for the network design at (use as a reference for your network
+# design): https://github.com/CollinPoetoehena/DevHub/blob/main/homelab/docs/1_Design/2_Design_Network.md
+################################################################################
+
+################################################################################
+# Network Interfaces
+################################################################################
+# WAN interface: connects to the ISP modem (upstream/home network).
+# The Pi's built-in Ethernet port is used for the WAN side.
+router_wan_interface: "eth0"
+
+# NetworkManager connection profile name for the WAN interface.
+router_wan_connection_name: "lab-wan"
+
+# LAN interface: connects to the lab switch (downstream/lab network).
+# A USB-to-Ethernet adapter provides the LAN interface.
+router_lan_interface: "eth1"
+
+# NetworkManager connection profile name for the LAN interface.
+# This is the name shown in `nmcli connection show` and used to manage the
+# static IP configuration. Must be unique across all NM connections.
+router_lan_connection_name: "lab-lan"
+
+################################################################################
+# LAN Network Configuration (Lab Network)
+# --- REQUIRED: override in group_vars/router/ ---
+################################################################################
+# Full CIDR notation for the overall lab supernet (e.g. "10.42.0.0/20").
+# All VLANs fit within this range.
+# router_lan_subnet:
+
+################################################################################
+# VLAN Configuration
+# --- REQUIRED: override in group_vars/router/ ---
+################################################################################
+# Physical eth1 has no IP (native VLAN 1 is unused for production traffic).
+# Each VLAN gets a sub-interface with its own gateway IP and DHCP range.
+# Format: list of dicts with id, name, interface, gateway_ip, cidr, netmask,
+#         dhcp_range_start, dhcp_range_end.
+# Example:
+#   router_vlans:
+#     - id: 10
+#       name: "Management"
+#       interface: "eth1.10"
+#       gateway_ip: "10.42.10.1"
+#       cidr: "24"
+#       netmask: "255.255.255.0"
+#       dhcp_range_start: "10.42.10.100"
+#       dhcp_range_end: "10.42.10.200"
+router_vlans: []
+
+################################################################################
+# Home Network (for firewall blocking rules)
+# --- REQUIRED: override in group_vars/router/ ---
+################################################################################
+# The home network subnet (used to block lab→home traffic).
+# router_home_subnet:
+# ISP modem/gateway IP (used for connectivity verification).
+# router_home_gateway:
+
+################################################################################
+# DHCP Configuration (dnsmasq)
+# --- REQUIRED: override in group_vars/router/ ---
+################################################################################
+# DHCP ranges are defined per-VLAN in router_vlans above.
+
+# Domain name for the lab network (optional, used for local DNS resolution).
+# router_dhcp_domain:
+
+# DHCP lease duration. How long a client keeps its assigned IP before renewing.
+router_dhcp_lease_time: "24h"
+
+################################################################################
+# DNS Configuration (dnsmasq)
+################################################################################
+# Upstream DNS servers that dnsmasq forwards queries to.
+# These are used when dnsmasq cannot resolve a name locally.
+router_dns_upstream_servers:
+  - "8.8.8.8" # Google Public DNS (primary)
+  - "8.8.4.4" # Google Public DNS (secondary)
+  - "1.1.1.1" # Cloudflare DNS (fallback)
+
+# Whether to enable DNS caching in dnsmasq (reduces external lookups).
+router_dns_cache_size: 1000
+
+################################################################################
+# Static DHCP Leases (MAC → IP reservations)
+################################################################################
+# Define static DHCP leases for lab devices that need fixed IPs.
+# Format: list of dicts with mac, ip, and hostname keys.
+# Example:
+#   router_static_leases:
+#     - { mac: "aa:bb:cc:dd:ee:01", ip: "10.42.10.2", hostname: "lab-switch" }
+#     - { mac: "aa:bb:cc:dd:ee:02", ip: "10.42.10.10", hostname: "pve1" }
+#     - { mac: "aa:bb:cc:dd:ee:03", ip: "10.42.10.11", hostname: "pve2" }
+router_static_leases: []
+
+################################################################################
+# Firewall / NAT Configuration
+################################################################################
+# Whether to enable NAT (masquerading) on the WAN interface.
+# Required for lab devices to reach the internet through the router.
+router_enable_nat: true
+
+# Whether to block traffic from lab network → home network.
+# This is an important security measure: if a lab device is compromised,
+# it should not be able to reach devices on the home network.
+router_block_lab_to_home: true
+
+# Whether to install and use iptables-persistent to save firewall rules
+# across reboots. Without this, rules are lost on reboot.
+router_iptables_persistent: true

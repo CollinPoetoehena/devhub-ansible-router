@@ -1,0 +1,19 @@
+galaxy_info:
+  author: CollinPoetoehena
+  description: Configure a Debian-based system (e.g. Raspberry Pi) as a dedicated lab router with DHCP, DNS, NAT, and firewall isolation
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+  galaxy_tags:
+    - router
+    - networking
+    - raspberrypi
+    - dhcp
+    - dns
+    - firewall
+    - nat
+    - homelab
+
+dependencies: []
