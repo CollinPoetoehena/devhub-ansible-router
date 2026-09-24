@@ -1,35 +1,39 @@
 ---
-# dhcp_dns.yml — Install and configure dnsmasq for DHCP and DNS on the lab network.
+# dhcp_dns.yml — Install and configure dnsmasq for DHCP, DNS, SLAAC and Router
+# Advertisements on the lab network.
 #
 # dnsmasq is a lightweight, easy-to-configure DHCP and DNS server. It is ideal
 # for a small homelab because:
-#   - Single package provides both DHCP and DNS (no need for separate ISC DHCP + BIND)
-#   - Minimal resource usage (perfect for a Raspberry Pi)
+#   - Single package provides DHCP (v4), DHCPv6/RA (v6) and DNS
+#   - Minimal resource usage (perfect for a Debian-based system like Raspberry Pi)
 #   - Simple configuration file format
 #   - Automatically adds DHCP hostnames to local DNS (lab devices can resolve
-#     each other by name, e.g. "ping pve1.lab.local")
+#     each other by name, e.g. "ping pve1.lab.local"), and with `ra-names` it
+#     does the same for SLAAC-derived IPv6 addresses
 # See for more details dnsmasq documentation: https://dnsmasq.org/doc.html and https://docs.opnsense.org/manual/dnsmasq.html
 # See for more details about dnsmasq also my DevHub reference: https://github.com/CollinPoetoehena/DevHub/blob/main/reference/network/dnsmasq.md
 #
 # What this task file does:
 #   1. Installs dnsmasq
 #   2. Deploys a configuration template that defines:
-#      - Which interface to listen on (LAN only — never serve DHCP on the WAN/home network!)
-#      - DHCP range and lease time for lab devices
+#      - Which interfaces to listen on (VLAN sub-interfaces only — never serve
+#        DHCP on the WAN/home network!)
+#      - DHCP range and lease time per VLAN (IPv4)
+#      - Router Advertisements + SLAAC per VLAN (IPv6)
 #      - Upstream DNS servers for internet name resolution
 #      - Static DHCP leases for devices that need fixed IPs
 #      - DNS caching to speed up repeated lookups
 #   3. Ensures dnsmasq is enabled and started
 #
-# IMPORTANT: dnsmasq only listens on the LAN interface (eth1). It NEVER serves
-# DHCP on the WAN side (eth0) — doing so would conflict with the ISP modem's
-# DHCP server and break the home network. This is exactly the kind of mistake
-# that the dedicated router approach is designed to prevent.
+# IMPORTANT: dnsmasq only listens on the VLAN sub-interfaces. It NEVER serves
+# DHCP or RAs on the WAN side (eth0) — doing so would conflict with the ISP
+# modem and break the home network. This is doubly important now that IPv6 is
+# enabled: an accidental Router Advertisement on the home LAN would hijack the
+# default route for every device in the house.
 
 ################################################################################
 # Install dnsmasq
 ################################################################################
-
 - name: Install dnsmasq
   ansible.builtin.apt:
     name: dnsmasq
@@ -40,9 +44,9 @@
 # Configure dnsmasq
 ################################################################################
 # The configuration is deployed from a Jinja2 template so that all network
-# parameters (IP ranges, interfaces, DNS servers) are driven by variables
-# defined in defaults/main.yml and can be overridden per-host or per-group.
-
+# parameters (IP ranges, interfaces, DNS servers, IPv6 prefixes) are driven by
+# variables defined in defaults/main.yml and can be overridden per-host or
+# per-group.
 - name: Deploy dnsmasq configuration
   ansible.builtin.template:
     src: dnsmasq.conf.j2
@@ -51,10 +55,13 @@
     group: root
     mode: "0644"
     backup: true
+    validate: "dnsmasq --test --conf-file=%s"
   notify: Restart dnsmasq
 
-# Fail fast if the generated config has syntax errors — prevents restarting
+# Fail fast if the running config has syntax errors — prevents restarting
 # dnsmasq with a broken config (which would take down DHCP/DNS for the lab).
+# The template above already validates before writing; this second check also
+# covers hand edits and included config fragments.
 - name: Validate dnsmasq configuration syntax
   ansible.builtin.command:
     cmd: dnsmasq --test
@@ -66,7 +73,6 @@
 # Some systems run systemd-resolved which binds to port 53 and conflicts with
 # dnsmasq. On Raspberry Pi OS Lite this is typically not installed, but we
 # check and disable it just in case to avoid port conflicts.
-
 - name: Check if systemd-resolved is present
   ansible.builtin.stat:
     path: /lib/systemd/system/systemd-resolved.service
@@ -82,7 +88,6 @@
 ################################################################################
 # Ensure dnsmasq is enabled and running
 ################################################################################
-
 - name: Ensure dnsmasq is enabled and started
   ansible.builtin.service:
     name: dnsmasq

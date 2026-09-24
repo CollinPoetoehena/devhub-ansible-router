@@ -1,0 +1,49 @@
+---
+# verify/summary.yml — One readable block with the result of every check.
+#
+# Runs last, and only reads variables registered by the other verify files.
+# Nothing is asserted here: anything that must fail has already failed.
+
+- name: Display verification results
+  ansible.builtin.debug:
+    msg:
+      - "==================== ROUTER VERIFICATION ===================="
+      - "--- Networking ---"
+      - "LAN connection ({{ router_lan_connection_name }}): {{ 'OK' if router_lan_connection_name in verify_nm_connections.stdout else 'MISSING' }}"
+      - "LAN carrier: {{ 'UP' if verify_lan_carrier.stdout | trim == '1' else 'DOWN (no cable)' }}"
+      - "LAN IPv4: {{ 'OK (none)' if verify_lan_no_ip is defined and 'inet ' not in (verify_lan_no_ip.stdout | default('')) else 'SKIPPED (no carrier)' if verify_lan_carrier.stdout | trim != '1' else 'UNEXPECTED IP PRESENT' }}"
+      - "LAN IPv6: {{ 'OK (none — native VLAN unused)' if 'inet6' not in (verify_lan_no_ipv6.stdout | default('')) else 'UNEXPECTED ADDRESS PRESENT' }}"
+      - "VLAN sub-interfaces: {{ router_vlans | map(attribute='interface') | join(', ') }}"
+      - "VLAN profiles: {{ 'OK' if verify_vlan_connections is not failed else 'MISSING' }}"
+      - "VLAN IPv4 gateways: {{ 'OK' if verify_vlan_ips is not failed else 'SKIPPED (no carrier)' if verify_lan_carrier.stdout | trim != '1' else 'MISMATCH' }}"
+      - "VLAN IPv6 gateways: {{ 'DISABLED' if not router_enable_ipv6 else 'OK' if verify_vlan_ips6 is defined and verify_vlan_ips6 is not failed else 'SKIPPED (no carrier)' if verify_lan_carrier.stdout | trim != '1' else 'MISMATCH' }}"
+      - "VLAN accept_ra: {{ 'DISABLED' if not router_enable_ipv6 else 'OK (router ignores RAs on LAN)' if verify_vlan_accept_ra is not failed else 'UNEXPECTED — router accepts RAs on a VLAN' }}"
+      - "WAN IPv4: {{ 'OK' if 'inet ' in verify_wan_ip.stdout else 'MISSING' }}"
+      - "WAN IPv6: {{ 'DISABLED' if not router_enable_ipv6 else 'OK (global address present)' if 'inet6' in (verify_wan_ip6.stdout | default('')) else 'NONE (ISP modem provides no IPv6 — lab still works over ULA)' }}"
+      - "IPv6 default route: {{ 'DISABLED' if not router_enable_ipv6 else 'OK' if (verify_ipv6_default_route.stdout | default('')) | length > 0 else 'NONE (no upstream IPv6 route learned via RA)' }}"
+      - "IPv4 forwarding: {{ 'ON' if verify_ip_forward.stdout | trim == '1' else 'OFF' }}"
+      - "IPv6 forwarding: {{ 'DISABLED' if not router_enable_ipv6 else 'ON' if verify_ip6_forward.stdout | trim == '1' else 'OFF' }}"
+      - "--- DHCP / DNS (dnsmasq) ---"
+      - "dnsmasq: {{ ansible_facts.services['dnsmasq.service'].state | default('unknown') }}"
+      - "DNS (port 53): {{ 'OK' if verify_dns_listen is defined and verify_dns_listen is not failed else 'SKIPPED (no carrier)' }}"
+      - "DHCPv4 (port 67): {{ 'OK' if (verify_dhcp_listen.rc | default(1)) == 0 else 'NOT LISTENING (expected if eth1 has no cable)' }}"
+      - "DHCPv6/RA (port 547): {{ 'DISABLED' if not router_enable_ipv6 else 'OK' if (verify_dhcp6_listen.rc | default(1)) == 0 else 'NOT LISTENING (expected if eth1 has no cable)' }}"
+      - "Router Advertisements: {{ 'DISABLED' if not router_enable_ipv6 else 'OK (enable-ra + SLAAC range per VLAN)' }}"
+      - "--- Firewall (nftables) ---"
+      - "Ruleset loaded: {{ 'OK' if 'table inet filter' in verify_nft_ruleset.stdout else 'MISSING' }}"
+      - "Default policies: {{ 'OK (input drop / forward drop)' if 'policy drop' in verify_nft_ruleset.stdout else 'NOT DEFAULT-DENY' }}"
+      - "NAT (IPv4 masquerade): {{ 'OK' if 'masquerade' in verify_nft_ruleset.stdout else 'MISSING' }}"
+      - "NAT66 (IPv6 masquerade): {{ 'DISABLED' if not (router_enable_ipv6 and router_enable_ipv6_nat) else 'OK' if router_lan_subnet_v6 in verify_nft_ruleset.stdout else 'MISSING' }}"
+      - "Lab→home block: {{ 'OK' if router_home_subnet in verify_nft_ruleset.stdout else 'MISSING' }}"
+      - "WAN→lab block: {{ 'OK' if 'SECURITY: block new WAN -> lab forwarding' in verify_nft_ruleset.stdout else 'MISSING' }}"
+      - "Inter-VLAN default policy: {{ router_inter_vlan_default_policy }}"
+      - "Legacy iptables rules: {{ 'NONE (good)' if (verify_legacy_iptables.stdout | trim | int) == 0 else (verify_legacy_iptables.stdout | trim) ~ ' STILL PRESENT — remove or reboot' }}"
+      - "--- Connectivity ---"
+      - "Gateway ping: {{ 'OK' if (verify_gateway_ping.rc | default(1)) == 0 else 'FAILED' }}"
+      - "Internet ping (IPv4): {{ 'OK' if (verify_internet_ping.rc | default(1)) == 0 else 'FAILED' }}"
+      - "Internet ping (IPv6): {{ 'DISABLED' if not router_enable_ipv6 else 'OK' if (verify_internet_ping6.rc | default(1)) == 0 else 'FAILED (expected if the ISP modem provides no IPv6)' }}"
+      - "DNS resolution (A): {{ 'OK' if (verify_dns_resolve.rc | default(1)) == 0 else 'FAILED' }}"
+      - "DNS resolution (AAAA): {{ 'DISABLED' if not router_enable_ipv6 else 'OK' if (verify_dns_resolve_aaaa.rc | default(1)) == 0 else 'FAILED' }}"
+      - "DNS over IPv6: {{ 'DISABLED' if not router_enable_ipv6 else 'OK' if (verify_dns_resolve_v6.rc | default(1)) == 0 else 'FAILED / SKIPPED (no carrier)' }}"
+      - "resolv.conf: {{ 'OK' if (verify_resolv_conf.rc | default(1)) == 0 else 'MISMATCH' }} — expected nameserver {{ router_home_gateway }} (router's own DNS via WAN DHCP — lab devices use dnsmasq)"
+      - "============================================================="

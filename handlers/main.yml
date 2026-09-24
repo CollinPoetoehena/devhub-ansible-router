@@ -5,9 +5,17 @@
 # (or when explicitly flushed). They ensure services are restarted/reloaded only
 # when their configuration has actually changed, avoiding unnecessary restarts.
 
-# Bring up (or restart) the LAN NetworkManager connection after the static IP
-# is created or modified. This applies the new IP to the interface immediately
-# without waiting for a reboot.
+# Bring up (or restart) the WAN NetworkManager connection after its IPv6
+# settings change, so the router picks up the ISP modem's Router Advertisement and
+# installs an IPv6 default route without waiting for a reboot.
+- name: Activate WAN connection
+  ansible.builtin.command:
+    cmd: "nmcli connection up {{ router_wan_connection_name }}"
+  changed_when: true
+
+# Bring up (or restart) the LAN NetworkManager connection after the profile
+# is created or modified. This applies the new configuration to the interface
+# immediately without waiting for a reboot.
 - name: Activate LAN connection
   ansible.builtin.command:
     cmd: "nmcli connection up {{ router_lan_connection_name }}"
@@ -23,16 +31,28 @@
   changed_when: true
 
 # Restart dnsmasq when its configuration file changes.
-# This applies new DHCP ranges, DNS settings, static leases, etc.
+# This applies new DHCP ranges, DNS settings, IPv6 RA settings, static leases, etc.
 - name: Restart dnsmasq
   ansible.builtin.service:
     name: dnsmasq
     state: restarted
 
-# Save iptables rules to disk so they persist across reboots.
-# Without this, any rule changes would be lost on the next reboot.
-# netfilter-persistent saves to /etc/iptables/rules.v4 (and rules.v6).
-- name: Save iptables rules
+################################################################################
+# nftables reload (replaces the old "Save iptables rules" handler)
+################################################################################
+# With iptables, rules lived in kernel memory and a separate save step
+# (netfilter-persistent) had to dump them to disk so they survived a reboot —
+# two operations that could silently disagree with each other.
+#
+# With nftables the configuration files ARE the firewall. Reloading means
+# re-reading {{ router_nftables_main_config }}, which flushes and re-applies the
+# complete ruleset in ONE atomic transaction: either the new ruleset becomes
+# active, or the old one stays. There is no half-applied state and no separate
+# save step.
+#
+# The ruleset is validated with `nft --check` in tasks/firewall/persist.yml
+# before this handler can run, so a syntax error never reaches the kernel.
+- name: Reload nftables
   ansible.builtin.command:
-    cmd: netfilter-persistent save
+    cmd: "nft --file {{ router_nftables_main_config }}"
   changed_when: true

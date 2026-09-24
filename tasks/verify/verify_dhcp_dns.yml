@@ -1,0 +1,75 @@
+---
+# verify/dhcp_dns.yml — dnsmasq service, listeners and IPv6 RA configuration.
+
+################################################################################
+# dnsmasq service
+################################################################################
+- name: Gather service facts for verification
+  ansible.builtin.service_facts:
+
+- name: Verify dnsmasq service is running
+  ansible.builtin.assert:
+    that: ansible_facts.services['dnsmasq.service'].state == 'running'
+    fail_msg: "dnsmasq is not running"
+    quiet: true
+
+################################################################################
+# DNS (port 53)
+################################################################################
+- name: Verify dnsmasq is listening on the VLAN interfaces (port 53)
+  ansible.builtin.command:
+    cmd: "ss -ulnp"
+  register: verify_dns_listen
+  changed_when: false
+  failed_when: "':53 ' not in verify_dns_listen.stdout"
+  # dnsmasq binds DNS to the VLAN sub-interface IPs; without carrier NM never
+  # assigns those IPs, so port 53 won't appear until a cable is connected.
+  when: verify_lan_carrier.stdout | trim == '1'
+
+################################################################################
+# DHCP (port 67) and DHCPv6 (port 547)
+################################################################################
+- name: Verify dnsmasq is serving DHCPv4 (port 67)
+  ansible.builtin.command:
+    cmd: "ss -ulnp"
+  register: verify_dhcp_listen
+  changed_when: false
+  failed_when: "':67 ' not in verify_dhcp_listen.stdout"
+  ignore_errors: true # DHCP only binds when eth1 has link (cable connected); can be skipped if not, just notify the user
+
+# With SLAAC the important signal is the RA sender, not a DHCPv6 socket, but
+# dnsmasq does open 547 when enable-ra is active. Non-fatal for the same
+# carrier-dependent reason as above.
+- name: Verify dnsmasq is serving DHCPv6/RA (port 547)
+  ansible.builtin.command:
+    cmd: "ss -ulnp"
+  register: verify_dhcp6_listen
+  changed_when: false
+  failed_when: "':547 ' not in verify_dhcp6_listen.stdout"
+  ignore_errors: true
+  when: router_enable_ipv6
+
+################################################################################
+# IPv6 Router Advertisement configuration
+################################################################################
+# Confirms the generated config actually enables RAs and declares a SLAAC range
+# for every VLAN. Without enable-ra, lab devices only ever get a link-local
+# address — the classic "IPv6 is enabled but nothing works" symptom.
+- name: Verify Router Advertisements are enabled in the dnsmasq config
+  ansible.builtin.command:
+    cmd: "grep -c '^enable-ra' /etc/dnsmasq.conf"
+  register: verify_enable_ra
+  changed_when: false
+  failed_when: verify_enable_ra.rc != 0
+  when: router_enable_ipv6
+
+- name: Verify a SLAAC range exists for every VLAN
+  ansible.builtin.command:
+    cmd: "grep -q 'set:vlan{{ item.id }}v6' /etc/dnsmasq.conf"
+  register: verify_slaac_ranges
+  changed_when: false
+  failed_when: verify_slaac_ranges.rc != 0
+  loop: "{{ router_vlans }}"
+  loop_control:
+    label: "vlan{{ item.id }} ({{ item.name }})"
+  when: router_enable_ipv6

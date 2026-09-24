@@ -1,18 +1,25 @@
 ---
 # packages.yml — Install utility packages for router administration and debugging.
+#
+# NOTE: the firewall tooling (nftables) is installed in firewall/install.yml,
+# not here, so that `--tags firewall` is self-contained and can be run on its
+# own without depending on the packages tag having run first.
 
 - name: Install utility packages
   ansible.builtin.apt:
     name:
-      - dnsutils # nslookup, dig — DNS debugging
+      - dnsutils # nslookup, dig — DNS debugging (dig -6 / AAAA for IPv6 testing)
       - tcpdump # packet capture for network debugging (https://www.tcpdump.org/index.html)
       - tshark # CLI Wireshark — deep packet inspection and protocol analysis (https://tshark.dev/)
-      - curl # HTTP testing
-      - nmap # network scanner — port scanning and host discovery
+      - curl # HTTP testing (curl -6 to force IPv6)
+      - nmap # network scanner — port scanning and host discovery (also does IPv6 with -6)
       - netcat-openbsd # nc — TCP/UDP connection testing and port listening
       - traceroute # trace packet route to destination
       - mtr-tiny # combined traceroute and ping with continuous stats
       - iperf3 # network bandwidth and throughput testing
-      - iputils-ping # ping — ICMP connectivity checks
+      - iputils-ping # ping — ICMP connectivity checks (ping -6 for ICMPv6)
+      - iputils-tracepath # tracepath/tracepath6 — path MTU discovery, very useful for IPv6
+      - ndisc6 # IPv6 Neighbour Discovery tools (rdisc6, ndisc6) — inspect Router Advertisements
+      - conntrack # inspect the connection tracking table used by the stateful nftables rules
     state: present
     update_cache: true

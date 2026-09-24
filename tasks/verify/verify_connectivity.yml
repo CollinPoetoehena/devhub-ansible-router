@@ -1,0 +1,101 @@
+---
+# verify/connectivity.yml — Can the router actually reach anything?
+#
+# All checks here are non-fatal (ignore_errors) because they depend on the
+# environment (cable plugged in, ISP modem reachable, internet working, ISP
+# providing IPv6). A failure is reported in the summary instead of aborting the
+# play — a router whose config is correct but whose uplink is unplugged should
+# not fail the playbook.
+
+################################################################################
+# WAN connectivity (IPv4)
+################################################################################
+- name: Verify router can reach ISP modem (WAN gateway)
+  ansible.builtin.command:
+    cmd: "ping -c 2 -W 3 {{ router_home_gateway }}"
+  register: verify_gateway_ping
+  changed_when: false
+  failed_when: verify_gateway_ping.rc != 0
+  ignore_errors: true
+
+- name: Verify router can reach the internet over IPv4
+  ansible.builtin.command:
+    cmd: "ping -c 2 -W 3 8.8.8.8"
+  register: verify_internet_ping
+  changed_when: false
+  failed_when: verify_internet_ping.rc != 0
+  ignore_errors: true
+
+################################################################################
+# WAN connectivity (IPv6)
+################################################################################
+# Whether this succeeds depends on the ISP modem actually providing IPv6. It is
+# reported, never fatal: the lab is fully functional on IPv4 while the IPv6
+# uplink is being sorted out, and seeing this check flip to OK is a nice,
+# concrete confirmation that dual-stack works end to end.
+- name: Verify router can reach the internet over IPv6
+  ansible.builtin.command:
+    cmd: "ping -6 -c 2 -W 3 2001:4860:4860::8888"
+  register: verify_internet_ping6
+  changed_when: false
+  failed_when: verify_internet_ping6.rc != 0
+  ignore_errors: true
+  when: router_enable_ipv6
+
+################################################################################
+# DNS resolution
+################################################################################
+- name: Verify DNS resolution works via dnsmasq (A record)
+  ansible.builtin.command:
+    cmd: "nslookup google.com {{ router_vlans[0].gateway_ip }}"
+  register: verify_dns_resolve
+  changed_when: false
+  failed_when: verify_dns_resolve.rc != 0
+  ignore_errors: true
+
+# Resolving an AAAA record exercises the dual-stack path through dnsmasq even
+# when the uplink itself has no IPv6 yet.
+- name: Verify AAAA resolution works via dnsmasq
+  ansible.builtin.command:
+    cmd: "nslookup -query=AAAA google.com {{ router_vlans[0].gateway_ip }}"
+  register: verify_dns_resolve_aaaa
+  changed_when: false
+  failed_when: verify_dns_resolve_aaaa.rc != 0
+  ignore_errors: true
+  when: router_enable_ipv6
+
+# Query dnsmasq over IPv6 itself (to the VLAN's ULA gateway address), proving
+# the listener, the firewall input rule and the address are all correct.
+- name: Verify dnsmasq answers queries sent over IPv6
+  ansible.builtin.command:
+    cmd: "nslookup google.com {{ router_vlans[0].gateway_ip6 }}"
+  register: verify_dns_resolve_v6
+  changed_when: false
+  failed_when: verify_dns_resolve_v6.rc != 0
+  ignore_errors: true
+  when:
+    - router_enable_ipv6
+    - verify_lan_carrier.stdout | trim == '1'
+
+################################################################################
+# resolv.conf
+################################################################################
+# The router's /etc/resolv.conf is managed by NetworkManager and points to the ISP
+# modem (e.g. 192.168.2.254) — the upstream DNS from the WAN DHCP lease.
+# This is CORRECT and EXPECTED for a router: the router itself resolves DNS via the
+# ISP modem directly, while LAB DEVICES use the router's dnsmasq (VLAN gateway IPs)
+# as their DNS server (configured via DHCP option 6 / RDNSS in dnsmasq.conf).
+- name: Verify /etc/resolv.conf nameserver matches WAN gateway
+  ansible.builtin.command:
+    cmd: "grep -q '^nameserver {{ router_home_gateway }}' /etc/resolv.conf"
+  register: verify_resolv_conf
+  changed_when: false
+  failed_when: verify_resolv_conf.rc != 0 # Return code (rc) 0 means grep found the expected nameserver; non-zero means it did not.
+  ignore_errors: true
+
+- name: Read /etc/resolv.conf for summary
+  ansible.builtin.command:
+    cmd: "grep '^nameserver' /etc/resolv.conf"
+  register: verify_resolv_content
+  changed_when: false
+  ignore_errors: true

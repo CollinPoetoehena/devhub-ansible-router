@@ -1,0 +1,80 @@
+#!/usr/sbin/nft -f
+# {{ ansible_managed }}
+#
+# Main nftables configuration for the lab router.
+# This file is managed by Ansible — do not edit manually.
+#
+################################################################################
+# nftables FILE FORMAT — the basics used in every file in this directory
+################################################################################
+# - Lines starting with "#" are comments and are ignored by nft. Jinja2 comment
+#   blocks ({# ... #}) are removed entirely before nft ever sees the file — they
+#   exist only for people reading the .j2 source, not for the rendered output.
+# - Every nftables STATEMENT ends implicitly at the end of the line (no ";"
+#   needed at statement level the way C-like languages use it); blocks use
+#   curly braces "{ }" the same way a config file or C block would.
+# - "table", "chain" and the individual rule lines are all read top to bottom.
+#   Order matters: this is the single most important nftables concept and it
+#   is why this whole ruleset is split into NUMBERED files (10, 20, 30, 40) —
+#   the include order below is the evaluation order.
+# - A shebang (`#!/usr/sbin/nft -f`) on line 1 lets this file be executed
+#   directly as `./nftables.conf` for quick manual testing, in addition to
+#   being loaded by nftables.service or `nft -f`.
+################################################################################
+# How this file works
+################################################################################
+# nftables.service loads exactly this file at boot. It deliberately contains no
+# rules of its own: it flushes the ruleset and then includes the numbered
+# fragments from {{ router_nftables_include_dir }}.
+#
+#   10-base.nft     tables, chains, hooks and default policies + shared defines
+#   20-nat.nft      NAT / masquerading (IPv4 and optionally IPv6)
+#   30-default.nft  static baseline rules (conntrack, ICMP(v6), hard denies)
+#   40-dynamic.nft  rules generated from router_vlans[].firewall
+#
+# The numbers matter: nftables evaluates rules inside a chain in the order they
+# were added, and the include glob expands in lexical order (10 before 20
+# before 30 before 40, as plain ASCII string sorting). So FILE ORDER IS POLICY
+# ORDER. Renaming "40-dynamic.nft" to "05-dynamic.nft" would silently move the
+# generated per-VLAN rules to evaluate BEFORE the hard security denies in
+# 30-default.nft — always keep the numeric prefixes as they are.
+#
+################################################################################
+# Statement 1: `flush ruleset`
+################################################################################
+# This is an nftables built-in command (not a rule) that deletes every table,
+# chain and rule currently loaded in the kernel — the entire firewall — before
+# anything in this file is (re)created. It is the nftables equivalent of
+# "start from a completely empty firewall".
+#
+# WHY `flush ruleset` at the top:
+#   Loading this file replaces the ENTIRE firewall in a single atomic
+#   transaction: either the whole new ruleset becomes active, or (if any
+#   syntax error is hit anywhere in any included file) NOTHING changes and the
+#   previously running ruleset stays exactly as it was. There is never a
+#   moment where the router is half-configured — that is what "atomic" means
+#   here, and it is the single biggest practical difference from iptables,
+#   where every rule is appended individually with its own separate command
+#   and a failure halfway through leaves an inconsistent firewall behind.
+#
+#   It also means re-running the playbook is genuinely idempotent: the result
+#   depends only on the files, not on whatever was loaded before (no leftover
+#   rules from a previous version of a template can ever survive a reload).
+flush ruleset
+
+################################################################################
+# Statement 2: `include "<glob>"`
+################################################################################
+# `include` is an nftables preprocessor directive: it works exactly like
+# copy-pasting the contents of every matching file at this exact point in the
+# file, in lexical (alphabetical) order of the filenames. It is NOT a shell
+# glob and does NOT support recursion into subdirectories — only flat files
+# directly inside {{ router_nftables_include_dir }} are picked up.
+#
+# Because the four fragment files each start with `table inet filter { ... }`
+# or `table inet nat { ... }`, and nftables allows a table to be "re-opened"
+# multiple times, each include effectively ADDS more chains/rules to the same
+# two tables that were first declared (empty) in 10-base.nft. This is exactly
+# like reopening a namespace: nftables merges same-named tables/chains defined
+# across multiple include'd files instead of erroring on a "duplicate".
+include "{{ router_nftables_include_dir }}/*.nft"

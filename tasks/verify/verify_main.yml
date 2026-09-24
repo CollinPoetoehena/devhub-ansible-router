@@ -1,0 +1,44 @@
+---
+# verify/main.yml — Entry point for post-configuration verification.
+#
+################################################################################
+# Why verification is a directory (same reasoning as the firewall)
+################################################################################
+# Verification grows with every feature: dual-stack addressing alone roughly
+# doubles the interface checks, and the nftables ruleset needs its own set of
+# assertions. A single verify.yml becomes a wall of near-identical commands
+# where it is hard to see what is actually being asserted.
+#
+# Split per subsystem, mirroring the task files they verify:
+#   networking.yml   - interfaces, addresses (v4 + v6), forwarding, RA settings
+#   dhcp_dns.yml     - dnsmasq service, DNS/DHCP listeners, RA configuration
+#   firewall.yml     - nftables ruleset: tables, policies, NAT, key rules
+#   connectivity.yml - can the router actually reach the gateway/internet/DNS
+#   summary.yml      - one readable block with the outcome of everything above
+#
+# Every check registers a variable that summary.yml reads, so summary.yml must
+# always run last.
+#
+# NOTE: verification is intentionally non-destructive and mostly non-fatal for
+# environment-dependent checks (no cable, no internet), while genuine
+# misconfiguration (missing profile, wrong IP, missing firewall rule) fails.
+
+- name: Verify networking (interfaces, addressing, forwarding)
+  ansible.builtin.import_tasks: verify_networking.yml
+  tags: [verify, router]
+
+- name: Verify DHCP and DNS (dnsmasq)
+  ansible.builtin.import_tasks: verify_dhcp_dns.yml
+  tags: [verify, router]
+
+- name: Verify firewall (nftables)
+  ansible.builtin.import_tasks: verify_firewall.yml
+  tags: [verify, firewall, nftables, router]
+
+- name: Verify connectivity
+  ansible.builtin.import_tasks: verify_connectivity.yml
+  tags: [verify, router]
+
+- name: Display verification summary
+  ansible.builtin.import_tasks: verify_summary.yml
+  tags: [verify, router]

@@ -1,25 +1,46 @@
 ---
-# networking.yml — Configure the Pi's network interfaces and IP forwarding.
+# networking.yml — Configure the router's network interfaces and IP forwarding.
 #
-# This task file handles the foundational networking setup that turns the Pi
+# This task file handles the foundational networking setup that turns the router
 # into a router:
 #   1. Ensure the physical LAN interface (eth1) is up with no IP (native VLAN
 #      is unused for production traffic).
-#   2. Create VLAN sub-interfaces (eth1.10, eth1.20, eth1.30) with static IPs
-#      so each VLAN has a predictable gateway address.
-#   3. Enable IPv4 forwarding in the kernel so packets can flow between the
-#      WAN (eth0) and VLAN sub-interfaces.
+#   2. Create VLAN sub-interfaces (eth1.10, eth1.20, eth1.30) with static
+#      DUAL-STACK addresses (IPv4 + IPv6 ULA) so each VLAN has a predictable
+#      gateway address in both address families.
+#   3. Enable IPv4 AND IPv6 forwarding in the kernel so packets can flow
+#      between the WAN (eth0) and the VLAN sub-interfaces.
 #
-# Without these steps, the Pi is just a regular host — it cannot route
+# Without these steps, the router is just a regular host — it cannot route
 # traffic between VLANs or to the internet.
+#
+################################################################################
+# Why the lab is now dual-stack instead of IPv4-only
+################################################################################
+# The previous version of this role explicitly set `method6: disabled` on every
+# interface. That was safe but it also meant the lab could never be used to
+# practise the thing that actually shows up in real networks today: IPv6.
+#
+# Running dual-stack here gives:
+#   - hands-on experience with SLAAC, Router Advertisements and Neighbour
+#     Discovery (the IPv6 replacements for DHCP and ARP);
+#   - a realistic firewall exercise, because IPv6 has no NAT to hide behind —
+#     every inbound flow must be allowed on purpose (see tasks/firewall/);
+#   - the ability to test dual-stack services, AAAA records and IPv6-only
+#     clients later on (Kubernetes, monitoring probes, and so on).
+#
+# The addressing uses ULA (fd42::/48) rather than a delegated global prefix,
+# because a prefix handed out by a consumer ISP modem can change at any reboot
+# and would renumber the whole lab. See roles/router/defaults/main.yml for the
+# full rationale (router_ipv6_mode / router_enable_ipv6_nat).
+################################################################################
 
 ################################################################################
 # WAN Interface (eth0) — DHCP, rename auto-created profile
 ################################################################################
 # NetworkManager auto-creates "Wired connection 1" for eth0. Rename it to something meaningful so `nmcli connection show` is readable.
-# Functionally this does not change anything, however it improves readability and management of  the network connections
+# Functionally this does not change anything, however it improves readability and management of the network connections
 # (e.g. can distinguish between WAN and LAN interfaces, etc.). So, this is still an important step to perform!
-
 - name: Find current NM connection name for WAN interface ({{ router_wan_interface }})
   ansible.builtin.command:
     cmd: "nmcli -t -f NAME,DEVICE connection show --active"
@@ -37,22 +58,53 @@
     - item.split(':')[0] != router_wan_connection_name
   changed_when: true
 
+# The WAN side takes its IPv6 configuration from the ISP modem via SLAAC/RA
+# (method6: auto). WHY auto and not manual:
+#   - the upstream prefix and default gateway are owned by the modem; hard
+#     coding them would break the moment the ISP renumbers;
+#   - "auto" also makes the router accept Router Advertisements on eth0, which is
+#     how it learns the IPv6 default route it needs to forward lab traffic.
+- name: Enable IPv6 (SLAAC/RA) on the WAN connection
+  ansible.builtin.command:
+    cmd: >-
+      nmcli connection modify "{{ router_wan_connection_name }}"
+      ipv6.method auto
+      ipv6.addr-gen-mode stable-privacy
+  when: router_enable_ipv6
+  changed_when: true
+  notify: Activate WAN connection
+
+# A Linux host that forwards packets normally IGNORES Router Advertisements,
+# because a router is expected to have its own static configuration. Since our
+# WAN side genuinely is a client of the ISP modem, accept_ra must be forced to
+# 2 ("accept RA even when forwarding is enabled") or the router will never install
+# an IPv6 default route and IPv6 egress silently fails.
+- name: Accept Router Advertisements (RAs) on WAN even though forwarding is enabled
+  ansible.builtin.sysctl:
+    name: "net.ipv6.conf.{{ router_wan_interface }}.accept_ra"
+    value: "2"
+    sysctl_set: true
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-router-ipv6.conf
+  when: router_enable_ipv6
+
 ################################################################################
 # Physical LAN Interface (eth1) — no IP, just link up
 ################################################################################
 # The physical eth1 interface must be up for VLAN sub-interfaces to work,
 # but carries no production traffic (native VLAN 1 is unused).
-# See TODO.md for why it is unused.
+# See for an example design where this is not used and why my homelab for reference:
+# https://github.com/CollinPoetoehena/DevHub/blob/main/homelab/docs/1_Design/2_Design_Network.md#why-vlan-1-native-is-not-used--all-traffic-is-explicitly-vlan-tagged
 #
 # The WAN interface (eth0) is left as DHCP — it gets its IP from the ISP modem.
 #
 # The community.general.nmcli module is idempotent: it creates the connection
 # on first run and only modifies it if parameters change on subsequent runs.
 #
-# NOTE: # NetworkManager is the network daemon on Raspberry Pi OS (Trixie/Debian 13+).
-# older Raspberry Pi OS versions used dhcpcd instead of NetworkManager.
-# If your Pi uses dhcpcd, configure the static IP in /etc/dhcpcd.conf instead.
-
+# NOTE: NetworkManager is the network daemon on Raspberry Pi OS (Trixie/Debian 13+).
+# Older Raspberry Pi OS versions used dhcpcd instead of NetworkManager.
+# If your router uses dhcpcd, configure the static IP in /etc/dhcpcd.conf instead.
 - name: Check if LAN connection profile already exists
   ansible.builtin.command:
     cmd: "nmcli -t -f ipv4.addresses connection show {{ router_lan_connection_name }}"
@@ -69,42 +121,65 @@
   when: lan_conn_check.rc == 0 and lan_conn_check.stdout | trim != ''
   changed_when: true
 
+# NOTE: the physical interface stays address-less in BOTH families. The native
+# VLAN carries no production traffic, so it gets no IPv4 and no IPv6 — giving
+# it a link-local-only "ignore" policy keeps the native VLAN genuinely unused.
 - name: Ensure physical LAN interface ({{ router_lan_interface }}) is up with no IP
   community.general.nmcli: # https://docs.ansible.com/projects/ansible/latest/collections/community/general/nmcli_module.html
     conn_name: "{{ router_lan_connection_name }}"
     ifname: "{{ router_lan_interface }}"
     type: ethernet # Physical Ethernet connection (not VLAN)
     method4: disabled # No IPv4 — native VLAN 1 carries no production traffic
-    method6: disabled # No IPv6 — lab is IPv4-only
+    method6: ignore # No IPv6 either — same reason (ignore = do not configure)
     autoconnect: true # Bring up automatically on boot / cable insert
     state: present # Create or update the NM profile (idempotent)
   notify: Activate LAN connection
 
 ################################################################################
-# VLAN Sub-Interfaces
+# VLAN Sub-Interfaces (dual-stack)
 ################################################################################
 # Create a VLAN sub-interface for each VLAN defined in router_vlans.
-# Each sub-interface gets a static IP (the gateway for that VLAN).
+# Each sub-interface gets a static IPv4 gateway address and, when IPv6 is
+# enabled, a static ULA gateway address (e.g. fd42:10::1/64).
 #
-# The community.general.nmcli module is idempotent: it creates the connection
-# on first run and only modifies it if parameters change on subsequent runs.
-
-- name: Create VLAN sub-interfaces
+# WHY the IPv6 address is static and method6 is "manual":
+#   The router is the gateway for the VLAN, so it must NOT autoconfigure itself
+#   from someone else's Router Advertisements — it is the device that SENDS the
+#   RAs (dnsmasq does that, see dhcp_dns.yml). A predictable ::1 address per
+#   VLAN also keeps firewall rules and documentation readable.
+- name: Create VLAN sub-interfaces (dual-stack)
   community.general.nmcli:
     conn_name: "vlan-{{ item.name | lower }}" # NM profile name (e.g. "vlan-management")
     ifname: "{{ item.interface }}" # Kernel interface name (e.g. "eth1.10")
     type: vlan # 802.1Q VLAN sub-interface — creates a virtual interface (e.g. eth1.20@eth1) that tags/untags Ethernet frames with the VLAN ID on the parent interface
     vlanid: "{{ item.id }}" # VLAN tag ID (e.g. 10)
-    vlandev: "{{ router_lan_interface }}" # Parent physical interface (eth1)
-    ip4: "{{ item.gateway_ip }}/{{ item.cidr }}" # Static gateway IP for this VLAN
+    vlandev: "{{ router_lan_interface }}" # Parent physical interface (the device, such as eth1)
+    ip4: "{{ item.gateway_ip }}/{{ item.cidr }}" # Static IPv4 gateway IP for this VLAN
     method4: manual # Static IPv4 (not DHCP) — the router IS the gateway
-    method6: disabled # No IPv6 — lab is IPv4-only
+    ip6: "{{ (item.gateway_ip6 ~ '/' ~ item.cidr6) if router_enable_ipv6 else omit }}"
+    method6: "{{ 'manual' if router_enable_ipv6 else 'ignore' }}"
     autoconnect: true
     state: present
   loop: "{{ router_vlans }}"
   loop_control:
     label: "{{ item.interface }} ({{ item.name }})"
   notify: Activate VLAN connections
+
+# A router must never autoconfigure itself from RAs on its own LAN side: doing
+# so would mean a rogue device on a VLAN could inject a default route into the
+# router. Explicitly refuse RAs on every VLAN sub-interface.
+- name: Refuse Router Advertisements on the VLAN sub-interfaces (router is the RA sender)
+  ansible.builtin.sysctl:
+    name: "net.ipv6.conf.{{ item.interface | replace('.', '/') }}.accept_ra"
+    value: "0"
+    sysctl_set: true
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-router-ipv6.conf
+  loop: "{{ router_vlans }}"
+  loop_control:
+    label: "{{ item.interface }}"
+  when: router_enable_ipv6
 
 # NetworkManager auto-creates "Wired connection N" profiles for detected
 # interfaces. These conflict with our managed profile and can cause the
@@ -127,16 +202,19 @@
   changed_when: true
 
 ################################################################################
-# IP Forwarding
+# IP Forwarding (IPv4 + IPv6)
 ################################################################################
 # By default, the Linux kernel does NOT forward packets between interfaces.
-# Enabling ip_forward tells the kernel to act as a router: packets arriving on
-# one interface (e.g. eth1 from a lab device) can be forwarded out another
+# Enabling forwarding tells the kernel to act as a router: packets arriving on
+# one interface (e.g. eth1.10 from a lab device) can be forwarded out another
 # interface (e.g. eth0 towards the internet), and vice versa.
 #
-# Without this, lab devices can reach the Pi itself but cannot get to the
-# internet or any other network — their packets just stop at the Pi.
-
+# Without this, lab devices can reach the router itself but cannot get to the
+# internet or any other network — their packets just stop at the router.
+#
+# IPv4 and IPv6 forwarding are two INDEPENDENT switches. Enabling only
+# net.ipv4.ip_forward is the single most common reason a "dual-stack" router
+# silently only routes IPv4.
 - name: Enable IPv4 forwarding (persist across reboots)
   ansible.builtin.sysctl:
     name: net.ipv4.ip_forward
@@ -148,3 +226,30 @@
     # The default target (/etc/sysctl.conf) can be overridden by files in
     # /etc/sysctl.d/ that load later, silently resetting ip_forward to 0.
     sysctl_file: /etc/sysctl.d/99-router-ip-forward.conf
+
+- name: Enable IPv6 forwarding (persist across reboots)
+  ansible.builtin.sysctl:
+    name: net.ipv6.conf.all.forwarding
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-router-ip-forward.conf
+  when: router_enable_ipv6
+
+# Make sure IPv6 is not globally disabled by a leftover sysctl from the old
+# IPv4-only configuration. If net.ipv6.conf.all.disable_ipv6 is 1, none of the
+# addressing above takes effect and the failure mode is confusing (NM reports
+# the address as configured while the kernel has no IPv6 stack on the link).
+- name: Ensure IPv6 is not globally disabled
+  ansible.builtin.sysctl:
+    name: "{{ item }}"
+    value: "0"
+    sysctl_set: true
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-router-ipv6.conf
+  loop:
+    - net.ipv6.conf.all.disable_ipv6
+    - net.ipv6.conf.default.disable_ipv6
+  when: router_enable_ipv6

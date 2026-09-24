@@ -16,7 +16,7 @@
 # Network Interfaces
 ################################################################################
 # WAN interface: connects to the ISP modem (upstream/home network).
-# The Pi's built-in Ethernet port is used for the WAN side.
+# The router's built-in Ethernet port is used for the WAN side.
 router_wan_interface: "eth0"
 
 # NetworkManager connection profile name for the WAN interface.
@@ -39,14 +39,108 @@ router_lan_connection_name: "lab-lan"
 # All VLANs fit within this range.
 # router_lan_subnet:
 
+# IPv6 equivalent of router_lan_subnet: the ULA supernet that contains every
+# per-VLAN /64 (e.g. "fd42:0:0::/48"). Used for the coarse-grained firewall
+# rules (lab -> home blocking, NAT66) in the same way as the IPv4 supernet.
+# router_lan_subnet_v6:
+
+################################################################################
+# IPv6
+################################################################################
+# WHY IPv6 is enabled in this lab (it used to be disabled everywhere):
+#   1. Practice: IPv6 is not optional knowledge anymore. ISPs (including KPN),
+#      cloud providers and Kubernetes all run dual-stack. The only way to get
+#      comfortable with SLAAC, Router Advertisements, Neighbour Discovery,
+#      ULA vs GUA and IPv6 firewalling is to actually run it.
+#   2. More possibilities: dual-stack unlocks realistic testing of services and
+#      monitoring over both address families (e.g. DNS over IPv6, dual-stack
+#      k8s, AAAA record behaviour) instead of a permanently IPv4-only lab.
+#   3. Correctness by default: disabling IPv6 "for safety" hides problems
+#      instead of solving them. A device with IPv6 silently enabled somewhere
+#      but no firewall policy is far more dangerous than a deliberately
+#      configured, firewalled dual-stack network.
+#   4. Realistic firewalling: there is no NAT to hide behind in IPv6, so every
+#      inbound flow must be explicitly allowed. That is exactly the discipline
+#      this role teaches (default policy drop, explicit allows).
+#
+# SECURITY NOTE: with IPv6 every host can have a globally routable address.
+# The default forward policy in this role is DROP and WAN -> LAN forwarding is
+# explicitly dropped, so nothing in the lab is reachable from outside unless a
+# rule is added on purpose.
+router_enable_ipv6: true
+
+# Use Unique Local Addresses (ULA, fd00::/8) for the lab VLANs instead of
+# relying on a delegated global prefix from the ISP modem. WHY:
+#   - A delegated prefix (DHCPv6-PD) can change when the modem reboots, which
+#     would renumber every VLAN, every firewall rule and every static lease.
+#   - Most consumer ISP modems either do not delegate a prefix downstream at
+#     all, or only delegate a single /64 (not enough for three VLANs).
+#   - ULA addresses are stable, private and perfect for a lab. They are the
+#     IPv6 equivalent of 10.42.0.0/20 in spirit (though NOT in mechanism: ULA
+#     is not "private because of NAT", it is simply not globally routed).
+router_ipv6_mode: "ula"
+
+# Because ULA addresses are not globally routable, outbound IPv6 traffic is
+# masqueraded to the WAN interface's IPv6 address, exactly like IPv4 NAT.
+# WHY NAT66 is normally considered bad practice, and why it is used here:
+#   - In production you would use a delegated GUA prefix and no NAT at all.
+#   - In a homelab behind an ISP modem that does not delegate a usable prefix,
+#     NAT66 (masquerade) is the pragmatic way to get working IPv6 egress while
+#     keeping stable internal addressing.
+#   - Set this to false the moment a proper prefix delegation is available.
+router_enable_ipv6_nat: true
+
 ################################################################################
 # VLAN Configuration
 # --- REQUIRED: override in group_vars/router/ ---
 ################################################################################
 # Physical eth1 has no IP (native VLAN 1 is unused for production traffic).
 # Each VLAN gets a sub-interface with its own gateway IP and DHCP range.
-# Format: list of dicts with id, name, interface, gateway_ip, cidr, netmask,
-#         dhcp_range_start, dhcp_range_end.
+#
+# Format: list of dicts with:
+#   id                 - 802.1Q VLAN ID (e.g. 10)
+#   name               - human readable name, also used for the NM profile
+#   interface          - kernel interface name (e.g. "eth1.10")
+#   gateway_ip         - IPv4 gateway address on this VLAN (the router itself)
+#   cidr               - IPv4 prefix length (e.g. "24")
+#   netmask            - IPv4 netmask (dnsmasq wants the dotted form)
+#   subnet             - IPv4 subnet in CIDR notation (e.g. "10.42.10.0/24")
+#   gateway_ip6        - IPv6 (ULA) gateway address (e.g. "fd42:10::1")
+#   cidr6              - IPv6 prefix length, always "64" for SLAAC to work
+#   subnet6            - IPv6 subnet in CIDR notation (e.g. "fd42:10::/64")
+#   dhcp_range_start   - first dynamic IPv4 lease
+#   dhcp_range_end     - last dynamic IPv4 lease
+#   firewall           - per-VLAN firewall policy, see below
+#
+# The `firewall` dict drives roles/router/tasks/firewall/dynamic.yml and is
+# rendered into nftables rules. All keys are optional:
+#
+#   allow_to_internet: true|false
+#       Allow this VLAN to be forwarded out of the WAN interface.
+#
+#   router_services: [ssh, dns, dhcp, icmp, ntp]
+#       Which services ON THE ROUTER ITSELF this VLAN may reach (input chain).
+#       Anything not listed is dropped by the default input policy.
+#
+#   inter_vlan:
+#       List of rules describing traffic from THIS VLAN to another VLAN.
+#       Each entry: { action: allow|drop|reject, to: <vlan id>,
+#                     proto: tcp|udp|icmp (optional),
+#                     ports: [ ... ] (optional),
+#                     comment: "..." (optional) }
+#       Evaluated before the global inter-VLAN default policy below.
+#
+#   custom:
+#       Free-form rules for anything the shortcuts above do not cover.
+#       Each entry: { action: allow|drop|reject,
+#                     chain: input|forward,
+#                     proto: tcp|udp|icmp (optional),
+#                     ports: [ ... ] (optional),
+#                     saddr: <address/prefix> (optional),
+#                     daddr: <address/prefix> (optional),
+#                     family: ip|ip6|both (optional, default both),
+#                     comment: "..." (optional) }
+#
 # Example:
 #   router_vlans:
 #     - id: 10
@@ -55,16 +149,31 @@ router_lan_connection_name: "lab-lan"
 #       gateway_ip: "10.42.10.1"
 #       cidr: "24"
 #       netmask: "255.255.255.0"
+#       subnet: "10.42.10.0/24"
+#       gateway_ip6: "fd42:10::1"
+#       cidr6: "64"
+#       subnet6: "fd42:10::/64"
 #       dhcp_range_start: "10.42.10.100"
 #       dhcp_range_end: "10.42.10.200"
+#       firewall:
+#         allow_to_internet: true
+#         router_services: [ssh, dns, dhcp, icmp]
+#         inter_vlan:
+#           - { action: allow, to: 20, comment: "Management may manage Services" }
 router_vlans: []
+
+# Default policy for traffic between lab VLANs when no explicit `inter_vlan`
+# rule matches. "drop" is the safe default: VLANs are isolated unless a flow is
+# explicitly allowed. Set to "allow" only for debugging.
+router_inter_vlan_default_policy: "drop"
 
 ################################################################################
 # Home Network (for firewall blocking rules)
 # --- REQUIRED: override in group_vars/router/ ---
 ################################################################################
-# The home network subnet (used to block lab→home traffic).
+# The home network subnet (used to block lab->home traffic).
 # router_home_subnet:
+
 # ISP modem/gateway IP (used for connectivity verification).
 # router_home_gateway:
 
@@ -80,43 +189,76 @@ router_vlans: []
 # DHCP lease duration. How long a client keeps its assigned IP before renewing.
 router_dhcp_lease_time: "24h"
 
+# Lifetime of the IPv6 Router Advertisements / SLAAC addresses handed out on
+# the VLANs. Kept shorter than the IPv4 lease so renumbering (if it ever
+# happens) converges quickly.
+router_dhcp_lease_time_v6: "4h"
+
 ################################################################################
 # DNS Configuration (dnsmasq)
 ################################################################################
 # Upstream DNS servers that dnsmasq forwards queries to.
 # These are used when dnsmasq cannot resolve a name locally.
+# Dual-stack on purpose: the router can then reach upstream resolvers over
+# whichever family currently works, which is also a nice way to observe IPv6
+# resolution behaviour in the lab.
 router_dns_upstream_servers:
-  - "8.8.8.8" # Google Public DNS (primary)
-  - "8.8.4.4" # Google Public DNS (secondary)
-  - "1.1.1.1" # Cloudflare DNS (fallback)
+  - "8.8.8.8" # Google Public DNS (primary, IPv4)
+  - "8.8.4.4" # Google Public DNS (secondary, IPv4)
+  - "1.1.1.1" # Cloudflare DNS (fallback, IPv4)
+  - "2001:4860:4860::8888" # Google Public DNS (primary, IPv6)
+  - "2606:4700:4700::1111" # Cloudflare DNS (fallback, IPv6)
 
 # Whether to enable DNS caching in dnsmasq (reduces external lookups).
 router_dns_cache_size: 1000
 
 ################################################################################
-# Static DHCP Leases (MAC → IP reservations)
+# Static DHCP Leases (MAC -> IP reservations)
 ################################################################################
 # Define static DHCP leases for lab devices that need fixed IPs.
 # Format: list of dicts with mac, ip, and hostname keys.
 # Example:
 #   router_static_leases:
 #     - { mac: "aa:bb:cc:dd:ee:01", ip: "10.42.10.2", hostname: "lab-switch" }
-#     - { mac: "aa:bb:cc:dd:ee:02", ip: "10.42.10.10", hostname: "pve1" }
-#     - { mac: "aa:bb:cc:dd:ee:03", ip: "10.42.10.11", hostname: "pve2" }
 router_static_leases: []
 
 ################################################################################
-# Firewall / NAT Configuration
+# Firewall / NAT Configuration (nftables)
 ################################################################################
-# Whether to enable NAT (masquerading) on the WAN interface.
+# Whether to enable NAT (masquerading) on the WAN interface for IPv4.
 # Required for lab devices to reach the internet through the router.
 router_enable_nat: true
 
-# Whether to block traffic from lab network → home network.
+# Whether to block traffic from lab network -> home network.
 # This is an important security measure: if a lab device is compromised,
 # it should not be able to reach devices on the home network.
 router_block_lab_to_home: true
 
-# Whether to install and use iptables-persistent to save firewall rules
-# across reboots. Without this, rules are lost on reboot.
-router_iptables_persistent: true
+# Directory holding the modular nftables rule fragments. The main
+# /etc/nftables.conf only flushes the ruleset and includes this directory, so
+# each concern (base tables, NAT, defaults, dynamic per-VLAN rules) lives in
+# its own file. Files are included in lexical order, which is why they are
+# numbered — in nftables, rule order inside a chain is evaluation order.
+router_nftables_include_dir: "/etc/nftables.d"
+
+# Main nftables configuration file loaded by the nftables.service at boot.
+router_nftables_main_config: "/etc/nftables.conf"
+
+# Log packets that hit the default drop policy. Extremely useful while
+# building rules; set to false if the journal gets noisy.
+router_nftables_log_drops: true
+
+# Rate limit for the drop logging above, to avoid filling the SD card when
+# something starts hammering the router.
+router_nftables_log_rate: "5/minute"
+
+# Whether the nftables service should be enabled so the ruleset is restored on
+# boot. This replaces the old iptables-persistent / netfilter-persistent setup:
+# nftables has native, atomic configuration reload built in.
+router_nftables_persistent: true
+
+# Remove the legacy iptables tooling and any leftover iptables-persistent rule
+# files. WHY: running both stacks at once means two independent rule sets are
+# evaluated for the same packet, which is the classic "my firewall works but
+# also doesn't" situation. See tasks/firewall/install.yml for the full story.
+router_remove_legacy_iptables: true

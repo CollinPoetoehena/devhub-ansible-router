@@ -1,0 +1,139 @@
+---
+# verify/firewall.yml — nftables ruleset verification.
+#
+# NOTE: this does NOT check every rule — there are far too many once per-VLAN
+# policy is generated. It verifies the STRUCTURE and the rules whose absence
+# would be dangerous or would silently break the lab:
+#   - the ruleset loads and the inet filter/nat tables exist
+#   - input and forward default policies are DROP
+#   - NAT masquerade exists (and NAT66 when enabled)
+#   - the lab -> home and WAN -> lab denies exist
+#   - every VLAN with allow_to_internet actually has its egress rule
+#   - the legacy iptables stack is really gone
+#
+# `nft list ruleset` is read once and every assertion works on that output, so
+# verification is one syscall-cheap command instead of a dozen.
+
+- name: Verify the nftables service is enabled
+  ansible.builtin.assert:
+    that: ansible_facts.services['nftables.service'].status in ['enabled', 'static']
+    fail_msg: "nftables.service is not enabled — the firewall would not survive a reboot"
+    quiet: true
+  when: router_nftables_persistent
+
+- name: Read the complete nftables ruleset
+  ansible.builtin.command:
+    cmd: "nft list ruleset"
+  register: verify_nft_ruleset
+  changed_when: false
+
+- name: Verify the inet filter table exists
+  ansible.builtin.assert:
+    that: "'table inet filter' in verify_nft_ruleset.stdout"
+    fail_msg: "The inet filter table is missing — the firewall is not loaded"
+    quiet: true
+
+- name: Verify the inet nat table exists
+  ansible.builtin.assert:
+    that: "'table inet nat' in verify_nft_ruleset.stdout"
+    fail_msg: "The inet nat table is missing — lab devices will have no internet access"
+    quiet: true
+
+# Default-deny is the whole security model of this router; a chain that ends up
+# with policy accept would silently expose the lab (especially over IPv6, where
+# there is no NAT in the way).
+- name: Verify the input chain default policy is drop
+  ansible.builtin.assert:
+    that: "'hook input priority filter; policy drop' in verify_nft_ruleset.stdout"
+    fail_msg: "The input chain policy is not drop — the router itself is not protected"
+    quiet: true
+
+- name: Verify the forward chain default policy is drop
+  ansible.builtin.assert:
+    that: "'hook forward priority filter; policy drop' in verify_nft_ruleset.stdout"
+    fail_msg: "The forward chain policy is not drop — traffic could cross the router unfiltered"
+    quiet: true
+
+################################################################################
+# NAT
+################################################################################
+- name: Verify the IPv4 NAT masquerade rule exists
+  ansible.builtin.assert:
+    that: "'ip saddr ' ~ router_lan_subnet ~ ' oifname \"' ~ router_wan_interface ~ '\"' in verify_nft_ruleset.stdout or 'masquerade' in verify_nft_ruleset.stdout"
+    fail_msg: "No IPv4 masquerade rule found — lab devices cannot reach the internet"
+    quiet: true
+  when: router_enable_nat
+
+- name: Verify the IPv6 NAT66 masquerade rule exists
+  ansible.builtin.assert:
+    that: "'ip6 saddr ' ~ router_lan_subnet_v6 in verify_nft_ruleset.stdout"
+    fail_msg: "No IPv6 masquerade rule found — lab ULA traffic cannot leave the router"
+    quiet: true
+  when:
+    - router_enable_ipv6
+    - router_enable_ipv6_nat
+
+################################################################################
+# Hard security boundaries
+################################################################################
+- name: Verify the lab-to-home blocking rule exists
+  ansible.builtin.assert:
+    that: "router_home_subnet in verify_nft_ruleset.stdout"
+    fail_msg: "The lab -> home network block is missing — lab devices could reach home devices"
+    quiet: true
+  when: router_block_lab_to_home
+
+- name: Verify new WAN-to-lab forwarding is blocked
+  ansible.builtin.assert:
+    that: "'SECURITY: block new WAN -> lab forwarding' in verify_nft_ruleset.stdout"
+    fail_msg: "The WAN -> lab block is missing — inbound connections into the lab would be possible"
+    quiet: true
+
+################################################################################
+# Generated per-VLAN policy
+################################################################################
+- name: Verify each VLAN with internet access has its egress rule
+  ansible.builtin.assert:
+    that: "'VLAN' ~ item.id ~ ' (' ~ item.name ~ ') -> internet' in verify_nft_ruleset.stdout"
+    fail_msg: "VLAN {{ item.id }} ({{ item.name }}) has allow_to_internet set but no matching rule was generated"
+    quiet: true
+  loop: "{{ router_vlans }}"
+  loop_control:
+    label: "vlan{{ item.id }} ({{ item.name }})"
+  when: (item.firewall | default({})).allow_to_internet | default(false)
+
+- name: Verify the inter-VLAN default policy rule is present
+  ansible.builtin.assert:
+    that: "'Inter-VLAN default policy' in verify_nft_ruleset.stdout"
+    fail_msg: "The inter-VLAN default policy rule is missing — VLAN isolation is not enforced as configured"
+    quiet: true
+
+################################################################################
+# Legacy stack must be gone
+################################################################################
+# Running iptables(-nft)/ufw alongside nftables means two independent rule sets
+# act on the same packet, which is impossible to reason about. Warn loudly
+# rather than fail, because a leftover legacy rule is usually harmless until it
+# is not.
+- name: Check for leftover legacy iptables rules
+  ansible.builtin.shell: |
+    set -o pipefail
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -S | grep -v '^-P' | wc -l
+    else
+      echo 0
+    fi
+  args:
+    executable: /bin/bash
+  register: verify_legacy_iptables
+  changed_when: false
+  failed_when: false
+
+- name: Warn if legacy iptables rules are still loaded
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ verify_legacy_iptables.stdout | trim }} legacy iptables rule(s)
+      are still present in the running kernel. nftables and iptables both act on
+      the same packets — remove the legacy rules (or reboot) so that
+      {{ router_nftables_main_config }} is the single source of truth.
+  when: (verify_legacy_iptables.stdout | trim | int) > 0

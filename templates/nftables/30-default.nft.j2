@@ -1,0 +1,237 @@
+# {{ ansible_managed }}
+#
+# 30-default.nft — Static baseline rules (identical in every deployment).
+# This file is managed by Ansible — do not edit manually.
+#
+# Loaded BEFORE 40-dynamic.nft on purpose: the hard security boundaries here
+# (lab -> home, WAN -> lab) must win over any per-VLAN allow rule, and in
+# nftables the first matching verdict inside a chain wins — a packet stops
+# being evaluated the instant a rule with a terminating statement (accept,
+# drop, reject) matches it. Rules further down the SAME chain, in a LATER
+# included file, are simply never reached for that packet.
+#
+# Rule formats for nftables: see 20-nat.nft > "RULE FORMAT — reading an nftables rule left to right"
+
+table inet filter {
+	chain input {
+		################################################################
+		# Stateful plumbing
+		################################################################
+		# `ct state <flags>` matches on CONNECTION TRACKING state — nftables
+		# (via the kernel's conntrack subsystem) remembers every connection
+		# that has passed through and classifies each new packet against it:
+		#   new         - first packet of a connection nftables has not seen yet
+		#   established - part of a connection that already had a reply
+		#   related     - a NEW connection that is logically tied to an
+		#                 existing one (e.g. an ICMP error about a TCP flow,
+		#                 or an FTP data channel opened because of a control
+		#                 channel) — without "related" those side-channels
+		#                 would be blocked even though the main flow is fine.
+		#   invalid     - conntrack cannot classify the packet at all
+		#
+		# Accept anything belonging to a connection the router itself
+		# started (e.g. apt, DNS lookups, NTP) or that is related to one. Without
+		# this single rule, the router's own outbound requests would receive
+		# replies that then get dropped by the `policy drop` on this chain,
+		# because a *reply* arriving on input still has to pass this chain.
+		ct state established,related counter accept comment "Allow return traffic for the router's own connections"
+
+		# Packets conntrack cannot classify are almost always spoofed or
+		# the result of a broken path (e.g. a TCP packet with an impossible
+		# flag combination, or one that arrives after conntrack already
+		# expired the connection). Dropping them early keeps the rest of the
+		# ruleset simpler because every later rule can assume "this is either
+		# a genuinely new or an established/related packet".
+		ct state invalid counter drop comment "Drop invalid packets"
+
+		# `iif lo` matches the INPUT INTERFACE by name equal to "lo" (loopback)
+		# — note this is the short match `iif`, distinct from the longer
+		# `iifname` used elsewhere in this file. Both match the same thing
+		# (`iif` additionally allows matching by interface INDEX, not just
+		# name, but that distinction rarely matters in practice). Local
+		# services talk to each other over loopback (e.g. dnsmasq answering its
+		# own health checks, etc.), and without this rule the default `policy
+		# drop` on this chain would silently break any such local traffic.
+		iif lo counter accept comment "Allow loopback traffic (required for local services on the router like dnsmasq)"
+
+		################################################################
+		# ICMP / ICMPv6
+		################################################################
+		# `icmpv6 type { a, b, c }` matches the ICMPv6 MESSAGE TYPE against a
+		# set literal (same `{ }` set syntax explained in 10-base.nft's
+		# `define LAN_IFACES` comment) — any one of the listed type names is a
+		# match. The type names below are nftables' built-in symbolic names
+		# for ICMPv6 types; they could also be written as raw numbers (e.g.
+		# type 135 for nd-neighbor-solicit) but the names are far more
+		# readable and self-documenting.
+		#
+		# ICMPv6 is NOT optional. Neighbour Discovery (nd-neighbor-*) replaces
+		# ARP, Router Solicitation/Advertisement (nd-router-*) replaces the
+		# "who is my gateway" part of DHCP, and Packet Too Big is what makes
+		# Path MTU (Maximum Transmission Unit) Discovery work (IPv6 routers never 
+		# fragment packets in flight the way IPv4 routers can). Blocking ICMPv6 does 
+		# not harden an IPv6 network — it breaks it.
+		#
+		# `ip6 hoplimit 255` is an ADDITIONAL match ANDed onto the same rule:
+		# the IPv6 Hop Limit field (IPv6's equivalent of IPv4 TTL) must equal
+		# exactly 255. This is the standard anti-spoofing check for Neighbour
+		# Discovery (ND): those messages must originate ON-LINK (i.e. from a
+		# directly connected neighbour, one hop away), and every router along
+		# any longer path decrements the hop limit by 1 per hop — so a packet
+		# that traversed even a single router in between could never still
+		# show 255 here. A forged ND message from further away is rejected by
+		# this check alone, before even considering source address spoofing.
+		icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } ip6 hoplimit 255 counter accept comment "IPv6 Neighbour Discovery (on-link only)"
+
+		# Same `icmpv6 type { ... }` set-match pattern, this time for the
+		# error message types that Path MTU Discovery depends on. No hoplimit
+		# restriction here: these errors legitimately originate from routers
+		# further away along the path (that is the whole point of PMTUD).
+		icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept comment "IPv6 error messages (required for Path MTU Discovery)"
+
+		# `ip6 saddr fe80::/10` restricts this rule to SOURCE addresses inside
+		# the IPv6 LINK-LOCAL range (fe80::/10 — the /10 prefix covers
+		# fe80:: through febf::, the standard link-local block). Multicast
+		# Listener Discovery is only ever legitimate from an on-link neighbour,
+		# so it is restricted the same way the ND messages above are
+		# restricted by hoplimit — just using a source-address range instead,
+		# since MLD does not use a fixed hop limit the way ND does.
+		icmpv6 type { mld-listener-query, mld-listener-report, mld-listener-done } ip6 saddr fe80::/10 counter accept comment "IPv6 multicast listener discovery (link-local only)"
+
+		# `icmp type echo-request` — the IPv4 equivalent of the icmpv6 rules
+		# above, matching a SINGLE type (ping) rather than a set, since only
+		# one type is needed here.
+		#
+		# `limit rate 10/second` is a STATEMENT (not a match): it is itself a
+		# stateful token-bucket rate limiter built into the rule. When a rule
+		# contains `limit rate N/unit`, the rule only "fires" (continues on to
+		# the next statement — here `counter accept`) for packets within that
+		# rate; packets exceeding the rate simply fall through to whatever
+		# rule comes next (in this case, eventually the chain's `policy drop`).
+		# This is what "rate limited" means in the comment: ping is allowed
+		# from everywhere for troubleshooting and for monitoring probes added
+		# later, but capped so it cannot be used to spin the CPU with a flood 
+		# of ICMP echo requests.
+		icmp type echo-request limit rate 10/second counter accept comment "Allow IPv4 ping (rate limited)"
+		icmpv6 type echo-request limit rate 10/second counter accept comment "Allow IPv6 ping (rate limited)"
+
+		################################################################
+		# Router management
+		################################################################
+		# `iifname $WAN` — matches the INPUT interface name against the WAN
+		# define from 10-base.nft (unlike `iif lo` above, `iifname` matches by
+		# NAME only, which is the normal/preferred form for named interfaces).
+		# `tcp dport 22` — matches the TCP DESTINATION PORT; "dport" always
+		# means "the port this packet is addressed TO", as opposed to "sport"
+		# (source port) which is not used in this rule.
+		# `ct state new` — this is the FIRST packet of a brand new connection
+		# (as opposed to `established`/`related` handled generically at the
+		# top of this chain); explicitly requiring `new` here means a rule
+		# like this only needs to open the door for the connection ATTEMPT —
+		# every subsequent packet of that same SSH session is already covered
+		# by the generic `ct state established,related accept` rule above,
+		# regardless of which specific rule originally admitted the `new`
+		# packet. This pattern (match `ct state new` on the specific opening
+		# rule, rely on the generic established/related rule for the rest) is
+		# used throughout this ruleset.
+		#
+		# SSH from the home network side. The router is the jumphost into the
+		# lab, so this is the only way in from a laptop on the home network ($WAN, 
+		# such as 192.168.2.0/24). Per-VLAN SSH access is granted in 40-dynamic.nft, 
+		# driven by each VLAN's `router_services` policy — the Services and IoT VLANs 
+		# do not get it.
+		iifname $WAN tcp dport 22 ct state new counter accept comment "Allow SSH to the router from the home network (jumphost access)"
+
+		# `udp dport { 546, 547 }` — a PORT SET (same `{ }` syntax as the
+		# icmpv6 type sets above, just applied to numeric ports instead of
+		# symbolic names): matches EITHER port 546 (DHCPv6 client) OR port 547
+		# (DHCPv6 server/relay) in one rule instead of two.
+		# DHCPv6 replies and Router Solicitations arrive on link-local
+		# addresses; dnsmasq needs to receive them to answer SLAAC/RA on
+		# the VLANs. The per-VLAN `dhcp` service rule in 40-dynamic.nft opens
+		# these same ports per-interface; this rule makes sure link-local
+		# sourced traffic specifically is never dropped first regardless of
+		# which interface it arrives on.
+{% if router_enable_ipv6 %}
+		ip6 saddr fe80::/10 udp dport { 546, 547 } counter accept comment "Allow DHCPv6 on link-local addresses"
+{% endif %}
+	}
+
+	chain forward {
+		################################################################
+		# Stateful plumbing
+		################################################################
+		# Same `ct state established,related` pattern as in the input chain
+		# above, but here it applies to FORWARDED traffic (packets routed
+		# THROUGH the router between two interfaces, rather than terminating
+		# on the router itself). This single rule is what makes return
+		# traffic from the internet work for every lab device: the lab
+		# device's outbound packet creates a conntrack entry when it is
+		# forwarded out the WAN interface, and the server's reply — arriving
+		# on the WAN interface, destined back into the lab — matches that
+		# entry as `established` and is allowed here.
+		#
+		# It MUST come before the WAN -> LAN drop rule further down this same
+		# chain, otherwise that later `drop` would match the reply packets
+		# too (first-match-wins does not care WHY a packet matches, only THAT
+		# it matches), and the lab could send but never receive anything.
+		ct state established,related counter accept comment "Allow return traffic for connections initiated from the lab"
+		ct state invalid counter drop comment "Drop invalid forwarded packets"
+
+		# Forwarded ICMPv6 error messages must survive, or Path MTU
+		# Discovery silently breaks for lab devices (connections hang on
+		# large packets instead of failing cleanly, because the "I had to
+		# drop your oversized packet, please resend smaller" notification
+		# never reaches the sender).
+		icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept comment "Forward IPv6 error messages (Path MTU Discovery)"
+
+		################################################################
+		# Hard security boundaries (defence in depth)
+		################################################################
+{% if router_block_lab_to_home %}
+		# `iifname $LAN_IFACES` — matches the INPUT interface against the SET
+		# of all lab VLAN interfaces defined in 10-base.nft (any one of $LAN_IFACES, 
+		# such as eth1.10/eth1.20/eth1.30 matches, same set-membership mechanism as
+		# the icmpv6 type sets above, just applied to interface names).
+		# `ip daddr $HOME_NET` — matches the IPv4 DESTINATION address against
+		# the home network CIDR. Combined, this rule reads as "a packet
+		# coming FROM any lab VLAN interface, addressed TO the home network".
+		#
+		# The lab must never reach the home network. NAT already makes this
+		# unlikely in the IPv4 case (lab devices don't know a route to
+		# $WAN, such as 192.168.2.0/24 in the first place), but this is the rule 
+		# that makes it IMPOSSIBLE regardless of routing mistakes — including for 
+		# IPv6, where there is no NAT hiding anything at all.
+		iifname $LAN_IFACES ip daddr $HOME_NET counter drop comment "SECURITY: block lab devices from reaching the home network (IPv4)"
+{% if router_enable_ipv6 %}
+		# Two match conditions on interfaces here: `iifname $LAN_IFACES`
+		# (came from a lab VLAN) AND `oifname $WAN` (is being routed out
+		# toward the WAN/home side) — both must be true. `ip6 daddr fc00::/7`
+		# matches the entire Unique Local Address range (fc00::/7 covers both
+		# fc00::/8 and fd00::/8), which is a broader net than just our own
+		# fd42::/48, deliberately: it also blocks a lab device from ever
+		# reaching some OTHER ULA range that might exist on the home side.
+		iifname $LAN_IFACES oifname $WAN ip6 daddr fc00::/7 counter drop comment "SECURITY: block lab IPv6 from reaching ULA addresses on the home side"
+		# Same interface-pair match, `ip6 daddr fe80::/10` this time — blocks
+		# lab devices from directly addressing a home-side device's
+		# link-local address on the way out through WAN.
+		iifname $LAN_IFACES oifname $WAN ip6 daddr fe80::/10 counter drop comment "SECURITY: block lab IPv6 from reaching link-local addresses on the home side"
+{% endif %}
+{% endif %}
+		# `iifname $WAN oifname $LAN_IFACES` — the mirror image of the block
+		# above: input interface is WAN, output interface is any lab VLAN.
+		# No `ct state` qualifier is given here, but it does not need one: any
+		# packet that is part of an existing connection was ALREADY accepted
+		# by the `ct state established,related` rule at the very top of this
+		# chain and therefore never reaches this line at all (first match
+		# wins). So in practice this rule only ever sees, and only ever
+		# drops, NEW inbound connection attempts.
+		#
+		# This matters far more with IPv6 enabled: without NAT, every lab
+		# device would otherwise be directly reachable from the internet the
+		# moment the ISP routes a prefix, since there is no private-address
+		# translation standing in the way the way IPv4 NAT incidentally
+		# provides.
+		iifname $WAN oifname $LAN_IFACES counter drop comment "SECURITY: block new WAN -> lab forwarding (defence in depth)"
+	}
+}

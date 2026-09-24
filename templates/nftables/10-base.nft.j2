@@ -1,0 +1,203 @@
+# {{ ansible_managed }}
+#
+# 10-base.nft — Shared definitions, tables, chains and default policies.
+# This file is managed by Ansible — do not edit manually.
+#
+# Loaded FIRST, so everything defined here is available to the fragments that
+# follow (e.g. 20-nat, 30-default, 40-dynamic). This file creates the empty
+# skeleton (tables + chains + policies); it intentionally contains almost no
+# actual filtering rules — those live in 30-default.nft and 40-dynamic.nft.
+
+################################################################################
+# Shared definitions — `define NAME = value`
+################################################################################
+# `define` is an nftables PREPROCESSOR macro (similar to #define in C): it is
+# a plain textual substitution performed once when the ruleset is parsed, NOT
+# a variable that is evaluated at rule-matching time. Every occurrence of
+# `$NAME` later in this file (and in every file included after this one, since
+# they share the same parse pass) is replaced with the literal text on the
+# right-hand side of the `=`.
+#
+# Using them keeps interface names and prefixes in exactly one place, so a
+# change in group_vars propagates to every rule instead of being copy-pasted
+# across 10-base/20-nat/30-default/40-dynamic.
+
+# WAN interface — faces the ISP modem / home network.
+# Renders to a quoted string, e.g.: define WAN = "eth0"
+# Used later as `oifname $WAN` or `iifname $WAN` (see "Matching syntax" below).
+define WAN = "{{ router_wan_interface }}"
+
+# All lab VLAN sub-interfaces as an ANONYMOUS SET.
+# nftables set literal syntax: `{ element1, element2, element3 }` — a set is
+# an unordered collection nftables can test membership against with a single
+# rule, instead of writing one rule per interface. Matching `iifname $LAN_IFACES`
+# is equivalent to `iifname eth1.10 or iifname eth1.20 or iifname eth1.30`, but
+# evaluated as one efficient lookup instead of N separate rules.
+#
+# NOTE: the old iptables configuration used the "eth1+" wildcard for this.
+# nftables sets are explicit: only the interfaces that really exist are
+# matched, so a stray interface named e.g. eth1abc can never accidentally be
+# treated as a lab VLAN (a "+" wildcard match would have included it).
+define LAN_IFACES = { {{ router_vlans | map(attribute='interface') | map('to_json') | join(', ') }} }
+
+# Home network (the network this router hangs off) — never reachable from lab.
+# Renders as a bare CIDR, e.g.: define HOME_NET = 192.168.2.0/24
+# Used later as `ip daddr $HOME_NET` (destination address matcher, IPv4 CIDR).
+define HOME_NET = {{ router_home_subnet }}
+
+# The lab supernet, used for NAT and coarse-grained rules.
+# CIDR notation again: network-address/prefix-length (e.g. 10.42.0.0/20 means
+# "the 4096 addresses from 10.42.0.0 to 10.42.15.255").
+define LAB_NET = {{ router_lan_subnet }}
+{% if router_enable_ipv6 %}
+# IPv6 counterpart of LAB_NET. IPv6 CIDR works the same way but the prefix is
+# almost always /64 per subnet; here it is the SUPERNET (/48) covering every
+# VLAN's /64, used only for the coarse NAT66 and forwarding rules below.
+define LAB_NET6 = {{ router_lan_subnet_v6 }}
+{% endif %}
+
+{% for vlan in router_vlans %}
+# VLAN {{ vlan.id }} — {{ vlan.name }}
+# Per-VLAN defines follow the pattern VLANxx_IF / VLANxx_NET / VLANxx_NET6.
+# These are not currently referenced elsewhere in this ruleset (the generated
+# rules in 40-dynamic.nft use the Ansible loop variable directly instead), but
+# they are defined here so that hand-written rules or future fragments can
+# refer to e.g. $VLAN10_NET instead of hard-coding "10.42.10.0/24" again.
+define VLAN{{ vlan.id }}_IF = "{{ vlan.interface }}"
+define VLAN{{ vlan.id }}_NET = {{ vlan.subnet }}
+{% if router_enable_ipv6 and vlan.subnet6 is defined %}
+define VLAN{{ vlan.id }}_NET6 = {{ vlan.subnet6 }}
+{% endif %}
+{% endfor %}
+
+################################################################################
+# Filter table (packet filtering) — `table <family> <name> { ... }`
+################################################################################
+# nftables SYNTAX ANATOMY of what follows:
+#
+#   table inet filter {        <- declares a table named "filter" in the
+#                                  "inet" address family (see below)
+#       chain input { ... }    <- a named chain INSIDE the table
+#       chain forward { ... }
+#       chain output { ... }
+#   }
+#
+# TABLE: a table is just a namespace that groups chains together. It has no
+# behaviour of its own — a table with no chains does nothing at all.
+#
+# FAMILY (`inet` here): the address family the table operates on. Options are
+# `ip` (IPv4 only), `ip6` (IPv6 only), `inet` (BOTH IPv4 and IPv6 in one
+# table), `arp`, `bridge` and `netdev`. `inet` = dual-stack: one table and one
+# set of rules handles both address families at once. With iptables this
+# needed two entirely separate rule sets (iptables + ip6tables) that
+# inevitably drift apart — the classic way an "IPv6-ready" network ends up
+# with an IPv4-only firewall. Because this lab is dual-stack, using anything
+# other than `inet` here would reintroduce exactly that risk.
+#
+# CHAIN: a named ordered list of rules. A chain by itself does nothing until
+# it is either a "base chain" (hooked into the kernel's packet processing
+# pipeline, as below) or referenced by a jump/goto from a base chain.
+#
+#   chain input {
+#       type filter hook input priority filter; policy drop;
+#   }
+#
+# BASE CHAIN header syntax, term by term:
+#   type filter   - this chain does packet FILTERING (accept/drop/reject).
+#                   Other types exist (`nat`, `route`) for different purposes;
+#                   the nat table below uses `type nat`.
+#   hook input    - WHICH point in the kernel's network stack this chain is
+#                   attached to. The standard hooks are:
+#                     prerouting  - packet just arrived, before routing decision
+#                     input       - packet is destined for THIS host
+#                     forward     - packet is being routed THROUGH this host
+#                     output      - packet was generated by THIS host
+#                     postrouting - packet is about to leave, after routing
+#   priority filter - WHEN, relative to other base chains on the same hook,
+#                   this chain runs. `filter` is a named priority constant
+#                   equal to 0; NAT chains use `dstnat`/`srcnat`, which are
+#                   different named constants placing them earlier/later in
+#                   the pipeline (see 20-nat.nft's `table inet nat` for that).
+#   policy drop   - the VERDICT applied to any packet that reaches the end of
+#                   this chain WITHOUT matching an explicit rule. This is the
+#                   single most important line in the whole firewall: it is
+#                   what makes the security model "default-deny" instead of
+#                   "default-allow, block the bad stuff".
+#
+# Default policies chosen for each chain:
+#   input   drop    — nothing reaches the router itself unless explicitly
+#                     allowed (see the SSH/DNS/DHCP/ICMP allow-rules in
+#                     30-default.nft and 40-dynamic.nft).
+#   forward drop    — nothing crosses the router from one interface to another
+#                     unless explicitly allowed (lab -> internet, lab -> lab).
+#   output  accept  — the router itself is a TRUSTED device that we manage;
+#                     filtering its own egress (e.g. apt, DNS lookups, NTP, RA)
+#                     adds maintenance cost with little practical security
+#                     benefit for a homelab.
+#
+# Default-deny on input/forward matters much more now that the lab is
+# dual-stack: IPv6 has no NAT to accidentally hide behind, so this firewall
+# chain is the ONLY boundary standing between a lab device and the internet.
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy drop;
+	}
+
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+	}
+}
+
+################################################################################
+# NAT table (address translation) — `table inet nat { ... }`
+################################################################################
+# Same `table`/`chain` syntax as above, but with `type nat` chains instead of
+# `type filter`. A NAT chain's job is to REWRITE addresses/ports, not to
+# accept/drop packets — that decision belongs entirely to the filter table.
+#
+# Chains are created here EMPTY (no rules yet) and filled in by 20-nat.nft,
+# which re-opens this same `table inet nat { }` block and adds the actual
+# `masquerade` rules inside `chain postrouting { }`.
+#
+#   chain prerouting {
+#       type nat hook prerouting priority dstnat; policy accept;
+#   }
+#   chain postrouting {
+#       type nat hook postrouting priority srcnat; policy accept;
+#   }
+#
+# HOOK + PRIORITY explained:
+#   prerouting  - fires as soon as a packet arrives, before the kernel decides
+#                 whether it is for this host or to be forwarded. This is
+#                 where DESTINATION NAT (DNAT / port-forwarding) would go —
+#                 not used in this lab yet, but the chain exists so a future
+#                 port-forward rule has somewhere to live.
+#   postrouting - fires just before a packet leaves an interface, after
+#                 routing. This is where SOURCE NAT (SNAT / MASQUERADE) goes —
+#                 this is what 20-nat.nft actually uses, to rewrite lab
+#                 devices' private source addresses to the router's WAN
+#                 address on the way out.
+#   priority dstnat / srcnat - named priority constants for the nat table,
+#                 analogous to `priority filter` above but positioned
+#                 correctly in the pipeline relative to routing and
+#                 connection tracking (these are the modern, readable
+#                 equivalents of the old iptables "-100" / "100" numeric
+#                 priorities).
+#
+# Policy accept: the NAT table decides *how* an address is translated, not
+# *whether* a packet is allowed through at all — that verdict is entirely the
+# filter table's job (see 10-base.nft's filter chains and their `policy drop`
+# above). A packet can be NATed here and still be dropped by the filter table.
+table inet nat {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+	}
+}

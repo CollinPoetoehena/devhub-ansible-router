@@ -1,0 +1,77 @@
+# {{ ansible_managed }}
+#
+# 20-nat.nft — NAT / masquerading rules.
+# This file is managed by Ansible — do not edit manually.
+#
+# Re-opening `table inet nat` here ADDS rules into the `postrouting` chain
+# that was already declared (empty) by 10-base.nft. nftables merges same-named
+# tables/chains across included files rather than treating this as a
+# duplicate — see the "include" explanation in nftables.conf.j2 for why.
+
+table inet nat {
+	chain postrouting {
+{% if router_enable_nat %}
+		################################################################
+		# RULE FORMAT — reading an nftables rule left to right
+		################################################################
+		# ip saddr $LAB_NET oifname $WAN counter masquerade comment "..."
+		#  │        │                │       │        │         │
+		#  │        │                │       │        │         └ comment: free-text label attached to
+		#  │        │                │       │        │           this exact rule; shown by `nft list ruleset`
+		#  │        │                │       │        │           and in `nft monitor` — makes debugging and
+		#  │        │                │       │        │           `nft list ruleset | grep` far easier than
+		#  │        │                │       │        │           trying to recognise bare match conditions.
+		#  │        │                │       │        └ masquerade: the VERDICT/statement for this rule — see below.
+		#  │        │                │       └ counter: a stateful packet+byte counter attached to this rule;
+		#  │        │                │         purely observational (does not affect matching), visible via
+		#  │        │                │         `nft list ruleset` as e.g. `packets 1234 bytes 56789`.
+		#  │        │                └ oifname $WAN: MATCH on the OUTGOING interface name — "oifname" reads as
+		#  │        │                  "output interface name". $WAN expands to the define from 10-base.nft.
+		#  │        └ ip saddr $LAB_NET: MATCH on the IPv4 SOURCE address, tested against the CIDR that
+		#  │          $LAB_NET expands to (10.42.0.0/20). Reads left to right as "family(ip) field(saddr) value".
+		#  └ ip: selects the IPv4 PROTOCOL FAMILY for the "saddr" match that follows on this line specifically
+		#    (independent from the table's own `inet` family — a single `inet` table rule can match `ip` fields,
+		#    `ip6` fields, or both on the same or different lines, which is exactly what this file does below).
+		#
+		# IMPORTANT: every match condition on one rule line is ANDed together.
+		# A packet must satisfy ALL of them (correct source AND correct output
+		# interface) before the statement (masquerade) is applied.
+		#
+		# IPv4: rewrite the source address of lab traffic leaving via the WAN
+		# to the router's own WAN address. MASQUERADE (rather than SNAT) picks
+		# up whatever address eth0 currently has, so a new DHCP lease from the
+		# ISP modem does not break internet access for the lab. Unlike a plain
+		# `accept`/`drop` verdict, `masquerade` both TRANSLATES the packet's
+		# source address/port AND implicitly accepts it for the nat table's
+		# purposes, and it registers the translation in the connection
+		# tracking table so RETURN traffic is automatically translated back.
+		ip saddr $LAB_NET oifname $WAN counter masquerade comment "NAT: masquerade lab IPv4 traffic to the internet"
+{% else %}
+		# NAT disabled via router_enable_nat=false — lab devices then need the
+		# upstream router to have a route back to {{ router_lan_subnet }}.
+{% endif %}
+{% if router_enable_ipv6 and router_enable_ipv6_nat %}
+
+		# IPv6 (NAT66): identical rule shape to the IPv4 one above, but using
+		# `ip6 saddr` instead of `ip saddr` to select the IPv6 protocol family
+		# for this line's source-address match. The lab uses ULA addressing
+		# (fd42::/48) because the ISP modem does not delegate a usable prefix.
+		# ULA is not globally routed, so egress is masqueraded to the WAN
+		# interface's IPv6 address exactly like IPv4 NAT.
+		#
+		# This is a deliberate lab compromise, not a production pattern: NAT66
+		# breaks end-to-end addressing and complicates logging, which is most
+		# of the point of IPv6. Set router_enable_ipv6_nat=false as soon as a
+		# real prefix delegation (DHCPv6-PD) is available, and the lab becomes
+		# properly routed dual-stack with no translation at all — at that
+		# point this whole `ip6 saddr ... masquerade` line simply disappears
+		# from the rendered file (see the "NAT disabled" branch just below).
+		ip6 saddr $LAB_NET6 oifname $WAN counter masquerade comment "NAT66: masquerade lab IPv6 (ULA) traffic to the internet"
+{% elif router_enable_ipv6 %}
+
+		# IPv6 NAT disabled (router_enable_ipv6_nat=false): IPv6 egress is
+		# expected to use globally routable addresses from a delegated prefix,
+		# so no masquerade rule is rendered here at all.
+{% endif %}
+	}
+}

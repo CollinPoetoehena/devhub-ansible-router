@@ -1,17 +1,27 @@
 ---
 # tasks file for devhub-ansible-router
 #
-# This role configures a Raspberry Pi as a dedicated lab router.
+# This role configures a Debian-based system (e.g. Raspberry Pi) as a dedicated lab router.
 # It provides:
-#   - Static IP on the LAN interface and IP forwarding (networking)
-#   - DHCP and DNS services for lab devices (dnsmasq)
+#   - VLAN sub-interfaces with dual-stack (IPv4 + IPv6 ULA) gateway addresses
+#     and IPv4/IPv6 forwarding (networking)
+#   - DHCP, DNS, SLAAC and Router Advertisements for lab devices (dnsmasq)
 #   - NAT (masquerading) so lab devices can reach the internet (firewall)
-#   - Firewall rules to isolate the lab from the home network (firewall)
+#   - nftables firewall rules to isolate the lab from the home network and to
+#     isolate the VLANs from each other (firewall)
 #
 # The tasks are split into separate files for clarity and maintainability.
 # Order matters: networking must be configured before DHCP/DNS (dnsmasq needs
-# the LAN interface to have an IP), and firewall rules depend on both interfaces
-# being properly configured.
+# the VLAN interfaces to have IPs), and firewall rules depend on both
+# interfaces being properly configured.
+#
+# firewall.yml is a single file even though it covers several concerns, because
+# it only DEPLOYS rule fragments — the rules themselves live in the templates
+# under templates/nftables/ (10-base, 20-nat, 30-default, 40-dynamic). See the
+# docstring at the top of firewall.yml for why.
+#
+# Verification is a directory because it grows per subsystem and each part
+# registers variables that the final summary reads.
 
 - name: Install utility packages
   ansible.builtin.import_tasks: packages.yml
@@ -25,17 +35,17 @@
   ansible.builtin.import_tasks: dhcp_dns.yml
   tags: [dhcp, dns, dnsmasq, router]
 
-- name: Configure firewall, NAT, and security rules
+- name: Configure firewall, NAT, and security rules (nftables)
   ansible.builtin.import_tasks: firewall.yml
-  tags: [firewall, nat, router]
+  tags: [firewall, nftables, nat, router]
 
-# Flush handlers before verification so that any pending restarts (e.g. dnsmasq
-# config change) are applied first. Without this, verify runs against the old
-# state and a failure aborts the play before handlers ever fire.
+# Flush handlers before verification so that any pending restarts (e.g. dnsmasq 
+# config change or an nftables reload) are applied first. Without this, verify runs 
+# against the old state and a failure aborts the play before handlers ever fire.
 - name: Flush pending handlers before verification
   ansible.builtin.meta: flush_handlers
   tags: [router]
 
 - name: Verify router setup
-  ansible.builtin.import_tasks: verify.yml
+  ansible.builtin.import_tasks: verify/verify_main.yml
   tags: [verify, router]

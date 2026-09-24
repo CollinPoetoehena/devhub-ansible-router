@@ -3,27 +3,35 @@
 # dnsmasq configuration for the lab router.
 # This file is managed by Ansible — do not edit manually.
 #
-# dnsmasq provides two services on the lab network:
-#   1. DHCP server: automatically assigns IP addresses to lab devices
-#   2. DNS server: resolves domain names for lab devices (forwarding to upstream
-#      DNS for internet domains, and resolving local hostnames from DHCP leases)
+# dnsmasq provides three services on the lab network:
+#   1. DHCP server (IPv4): automatically assigns IP addresses to lab devices
+#   2. Router Advertisements + SLAAC (IPv6): tells lab devices their prefix,
+#      gateway and DNS server — the IPv6 equivalent of handing out a lease
+#   3. DNS server: resolves domain names for lab devices (forwarding to upstream
+#      DNS for internet domains, and resolving local hostnames from DHCP leases
+#      and from SLAAC addresses via ra-names)
 #
 # See for details on the network design and used variables, such as the LAN subnet, 
 # DHCP range, and static leases, etc., an example in my homelab documentation (can be 
-# used as a reference): https://github.com/CollinPoetoehena/DevHub/blob/main/homelab/docs/1_Design/2_Design_Network.md 
+# used as a reference): https://github.com/CollinPoetoehena/DevHub/blob/main/homelab/docs/1_Design/2_Design_Network.md
 
 ################################################################################
 # Interface binding:
-# Explicitly bind dnsmasq only to the LAN interfaces (the VLAN sub-interfaces) and 
-# exclude lo interface, so that DNS queries must be sent to the router's LAN IPs of 
-# the VLAN sub-interfaces (e.g., 10.42.10.1) instead of 127.0.0.1 (localhost). This is 
-# intentional: binding only to the LAN interface prevents dnsmasq from answering DNS or 
-# DHCP requests on unintended interfaces (like WAN (breaking the home network because it 
-# conflicts with the ISP modem) or localhost), which keeps the router safe and avoids 
-# conflicts with other local DNS services. As a result, DNS queries must be sent to the 
+# Explicitly bind dnsmasq only to the LAN interfaces (the VLAN sub-interfaces) and
+# exclude lo interface, so that DNS queries must be sent to the router's LAN IPs of
+# the VLAN sub-interfaces (e.g., 10.42.10.1) instead of 127.0.0.1 (localhost). This is
+# intentional: binding only to the LAN interface prevents dnsmasq from answering DNS or
+# DHCP requests on unintended interfaces (like WAN (breaking the home network because it
+# conflicts with the ISP modem) or localhost), which keeps the router safe and avoids
+# conflicts with other local DNS services. As a result, DNS queries must be sent to the
 # router's LAN IPs of the VLAN sub-interfaces (e.g., 10.42.10.1) instead of 127.0.0.1.
+#
+# This is even more important now that IPv6 is enabled: an accidental Router
+# Advertisement sent out of the WAN interface would announce this router as a
+# default gateway to the WHOLE house, hijacking IPv6 traffic for every device.
+# Interface binding is what makes that impossible.
 ################################################################################
-# Only listen on VLAN sub-interfaces. NEVER serve DHCP or DNS on the WAN
+# Only listen on VLAN sub-interfaces. NEVER serve DHCP, RAs or DNS on the WAN
 # interface (eth0) — doing so would conflict with the ISP modem and break the
 # home network for everyone in the house.
 {% for vlan in router_vlans %}
@@ -32,12 +40,12 @@ interface={{ vlan.interface }}
 
 # Exclude loopback: dnsmasq implicitly includes lo even when interface= is set.
 # If anything else listens on 127.0.0.1:53 (e.g. systemd-resolved stub), dnsmasq
-# fails with "Address already in use". The router only needs DNS/DHCP on the 
+# fails with "Address already in use". The router only needs DNS/DHCP on the
 # LAN interfaces (the VLAN sub-interfaces), as explained above.
 except-interface=lo
 
-# This is an extra safety measure in addition to the "interface" directive above. 
-# bind-interfaces or bind-dynamic ensures dnsmasq only binds to the specified interface, 
+# This is an extra safety measure in addition to the "interface" directive above.
+# bind-interfaces or bind-dynamic ensures dnsmasq only binds to the specified interface,
 # not all interfaces.
 # bind-dynamic is a safer alternative to bind-interfaces. Both prevent dnsmasq
 # from listening on all interfaces (which would serve DHCP on the WAN side and
@@ -64,12 +72,16 @@ bind-dynamic
 # These are the DNS servers that dnsmasq forwards queries to when it cannot
 # resolve a name locally (i.e. for internet domain names like google.com).
 # dnsmasq queries them in order and uses whichever responds fastest.
+#
+# The list is dual-stack on purpose: forwarding over IPv6 is a good, low-risk
+# way to see real IPv6 traffic in the lab, and it keeps name resolution working
+# if one address family has a problem.
 {% for dns_server in router_dns_upstream_servers %}
 server={{ dns_server }}
 {% endfor %}
 
 # Do not read /etc/resolv.conf for upstream DNS servers.
-# We explicitly define them below so the configuration is fully self-contained
+# We explicitly define them above so the configuration is fully self-contained
 # and not affected by DHCP-provided DNS from the ISP modem.
 no-resolv
 
@@ -89,8 +101,17 @@ domain={{ router_dhcp_domain }}
 # for both "pve1" and "pve1.{{ router_dhcp_domain }}".
 expand-hosts
 
+{% if router_enable_ipv6 %}
+# Do not forward AAAA queries for names that only exist locally, and make sure
+# a local name lookup returns both the A and the AAAA record when the device
+# has a SLAAC address (see `ra-names` below). This is what makes
+# "ping6 pve1.{{ router_dhcp_domain }}" work without any manual AAAA records.
+domain-needed
+bogus-priv
+{% endif %}
+
 ################################################################################
-# DHCP configuration
+# DHCP configuration (IPv4)
 ################################################################################
 # Mark dnsmasq as the only DHCP server on this network. Without this, dnsmasq
 # is conservative: it waits longer before responding to DHCPDISCOVER and won't
@@ -117,12 +138,62 @@ dhcp-option=tag:vlan{{ vlan.id }},3,{{ vlan.gateway_ip }}
 dhcp-option=tag:vlan{{ vlan.id }},6,{{ vlan.gateway_ip }}
 {% endfor %}
 
+{% if router_enable_ipv6 %}
+################################################################################
+# IPv6: Router Advertisements + SLAAC
+################################################################################
+# There is no "DHCP server" in the IPv4 sense here. IPv6 hosts normally
+# configure themselves with SLAAC: the router periodically multicasts a Router
+# Advertisement (RA) containing the /64 prefix and announcing itself as the
+# default gateway, and each host derives its own address from that prefix.
+#
+# WHY SLAAC instead of stateful DHCPv6:
+#   - It is how IPv6 is designed to work and what every OS supports out of the
+#     box (some Android devices still do not implement stateful DHCPv6 at all).
+#   - There is no lease database to keep, so nothing to corrupt or resync.
+#   - Addresses stay stable because NetworkManager/systemd use stable-privacy
+#     addressing, while still being unpredictable from outside.
+#
+# Enable the RA sender. Without this line dnsmasq hands out nothing on IPv6 and
+# lab devices end up with a link-local address only ("IPv6 is broken" symptom).
+enable-ra
+
+# One RA range per VLAN. "slaac" = announce the prefix and let hosts build
+# their own address. "ra-names" additionally probes the SLAAC address derived
+# from a DHCPv4 client's MAC and, if it answers, publishes an AAAA record for
+# that hostname — so local DNS is dual-stack without any manual records.
+{% for vlan in router_vlans %}
+dhcp-range=set:vlan{{ vlan.id }}v6,{{ vlan.subnet6 | regex_replace('/[0-9]+$', '') }},slaac,{{ vlan.cidr6 }},{{ router_dhcp_lease_time_v6 }}
+{% endfor %}
+{% for vlan in router_vlans %}
+dhcp-option=tag:vlan{{ vlan.id }}v6,option6:dns-server,[{{ vlan.gateway_ip6 }}]
+{% endfor %}
+
+# Publish AAAA records for SLAAC hosts that also took a DHCPv4 lease.
+ra-names
+
+# Set a HIGH router preference in the RAs sent on the lab VLANs. dnsmasq also
+# includes the RDNSS option (RFC 8106) automatically, so clients that never
+# speak DHCPv6 at all still learn this router as their IPv6 DNS server.
+#
+# NOTE: do NOT add a router-lifetime of 0 here (e.g. `ra-param=*,high,0,0`) —
+# a lifetime of 0 explicitly tells clients "I am not a default router", which
+# would leave every lab device with an address but no IPv6 gateway.
+ra-param=*,high
+{% endif %}
+
 ################################################################################
 # Static DHCP leases (MAC → IP reservations)
 ################################################################################
 # Devices that need a fixed IP address regardless of DHCP order.
 # Useful for servers (Proxmox hosts, k8s nodes) that other devices need to
 # reach at a known address.
+#
+# NOTE (IPv6): there are deliberately no static IPv6 reservations. Devices get
+# a stable SLAAC address and dnsmasq publishes the matching AAAA record via
+# ra-names, so lab services should be referenced by NAME, not by literal IPv6
+# address. That habit is worth building: hard-coding IPv6 literals is exactly
+# what makes IPv6 painful later.
 {% if router_static_leases | length > 0 %}
 {% for lease in router_static_leases %}
 # {{ lease.hostname }}

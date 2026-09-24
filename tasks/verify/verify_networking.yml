@@ -1,0 +1,174 @@
+---
+# verify/networking.yml — Interfaces, addressing (IPv4 + IPv6) and forwarding.
+#
+# The IPv6 checks are the inverse of what they used to be: the old role
+# asserted that no global IPv6 address existed anywhere. Now that the lab is
+# deliberately dual-stack, the assertions verify that each VLAN actually HAS
+# its ULA gateway address, and that the physical (native VLAN) interface still
+# has none.
+
+################################################################################
+# Physical LAN Interface (eth1)
+################################################################################
+# The physical interface must exist as an NM profile, have carrier (cable),
+# be UP and have NO addresses at all (native VLAN carries no production traffic).
+- name: Verify LAN connection profile exists in NetworkManager
+  ansible.builtin.command:
+    cmd: "nmcli -t -f NAME connection show"
+  register: verify_nm_connections
+  changed_when: false
+  failed_when: router_lan_connection_name not in verify_nm_connections.stdout
+
+- name: Check LAN interface carrier state
+  ansible.builtin.command:
+    cmd: "cat /sys/class/net/{{ router_lan_interface }}/carrier"
+  register: verify_lan_carrier
+  changed_when: false
+  failed_when: false
+
+- name: Verify LAN interface ({{ router_lan_interface }}) is UP
+  ansible.builtin.command:
+    cmd: "ip link show {{ router_lan_interface }}"
+  register: verify_lan_link
+  changed_when: false
+  failed_when: "'state UP' not in verify_lan_link.stdout"
+  when: verify_lan_carrier.stdout | trim == '1'
+
+- name: Verify LAN interface has no IPv4 address (native VLAN unused)
+  ansible.builtin.command:
+    cmd: "ip -4 addr show {{ router_lan_interface }}"
+  register: verify_lan_no_ip
+  changed_when: false
+  failed_when: "'inet ' in verify_lan_no_ip.stdout"
+  when: verify_lan_carrier.stdout | trim == '1'
+
+# Still asserted even though IPv6 is now enabled lab-wide: the NATIVE VLAN is
+# unused, so the physical interface must not pick up a global IPv6 address
+# either (which would happen if it ever accepted an RA from somewhere).
+- name: Verify LAN interface has no global IPv6 address (native VLAN unused)
+  ansible.builtin.command:
+    cmd: "ip -6 addr show {{ router_lan_interface }} scope global"
+  register: verify_lan_no_ipv6
+  changed_when: false
+  failed_when: "'inet6' in verify_lan_no_ipv6.stdout"
+
+- name: Warn if LAN interface has no carrier (no cable connected)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ router_lan_interface }} has no carrier (no cable connected).
+      VLAN sub-interface IPs will be assigned automatically by NetworkManager
+      once a cable is plugged in.
+  when: verify_lan_carrier.stdout | trim != '1'
+
+################################################################################
+# VLAN Sub-Interfaces (eth1.10, eth1.20, eth1.30) — dual-stack
+################################################################################
+- name: Verify VLAN connection profiles exist in NetworkManager
+  ansible.builtin.command:
+    cmd: "nmcli -t -f NAME connection show"
+  register: verify_vlan_connections
+  changed_when: false
+  failed_when: "'vlan-' ~ (item.name | lower) not in verify_vlan_connections.stdout"
+  loop: "{{ router_vlans }}"
+  loop_control:
+    label: "vlan-{{ item.name | lower }}"
+
+- name: Verify VLAN sub-interfaces are UP
+  ansible.builtin.command:
+    cmd: "ip link show {{ item.interface }}"
+  register: verify_vlan_links
+  changed_when: false
+  failed_when: "'state UP' not in verify_vlan_links.stdout"
+  loop: "{{ router_vlans }}"
+  loop_control:
+    label: "{{ item.interface }} ({{ item.name }})"
+  when: verify_lan_carrier.stdout | trim == '1'
+
+- name: Verify VLAN sub-interfaces have correct IPv4 gateway addresses
+  ansible.builtin.command:
+    cmd: "ip -4 addr show {{ item.interface }}"
+  register: verify_vlan_ips
+  changed_when: false
+  failed_when: "(item.gateway_ip ~ '/' ~ item.cidr) not in verify_vlan_ips.stdout"
+  loop: "{{ router_vlans }}"
+  loop_control:
+    label: "{{ item.interface }} ({{ item.name }})"
+  when: verify_lan_carrier.stdout | trim == '1'
+
+# NEW: the IPv6 gateway address must be present. A missing ULA address is the
+# usual reason lab devices get a SLAAC address but cannot reach their gateway.
+- name: Verify VLAN sub-interfaces have correct IPv6 (ULA) gateway addresses
+  ansible.builtin.command:
+    cmd: "ip -6 addr show {{ item.interface }}"
+  register: verify_vlan_ips6
+  changed_when: false
+  failed_when: "(item.gateway_ip6 ~ '/' ~ item.cidr6) not in verify_vlan_ips6.stdout"
+  loop: "{{ router_vlans }}"
+  loop_control:
+    label: "{{ item.interface }} ({{ item.name }})"
+  when:
+    - router_enable_ipv6
+    - verify_lan_carrier.stdout | trim == '1'
+
+# A router must not autoconfigure itself from Router Advertisements on its own
+# LAN side — otherwise any device on a VLAN could inject a default route into
+# the router. accept_ra must be 0 on every VLAN sub-interface.
+- name: Verify the router refuses Router Advertisements on the VLAN interfaces
+  ansible.builtin.command:
+    cmd: "sysctl -n net.ipv6.conf.{{ item.interface | replace('.', '/') }}.accept_ra"
+  register: verify_vlan_accept_ra
+  changed_when: false
+  failed_when: verify_vlan_accept_ra.stdout | trim != '0'
+  loop: "{{ router_vlans }}"
+  loop_control:
+    label: "{{ item.interface }}"
+  when: router_enable_ipv6
+
+################################################################################
+# WAN Interface (eth0)
+################################################################################
+- name: Verify WAN interface has an IPv4 address (DHCP from ISP modem)
+  ansible.builtin.command:
+    cmd: "ip -4 addr show {{ router_wan_interface }}"
+  register: verify_wan_ip
+  changed_when: false
+  failed_when: "'inet ' not in verify_wan_ip.stdout"
+
+# Non-fatal: whether the WAN side gets a global IPv6 address depends entirely
+# on the ISP modem. The lab still works (ULA + NAT66 simply has nowhere to go)
+# and this is exactly the kind of thing worth SEEING in the summary rather than
+# failing the play over.
+- name: Check whether WAN has a global IPv6 address (depends on the ISP modem)
+  ansible.builtin.command:
+    cmd: "ip -6 addr show {{ router_wan_interface }} scope global"
+  register: verify_wan_ip6
+  changed_when: false
+  failed_when: false
+  when: router_enable_ipv6
+
+- name: Check for an IPv6 default route (learned via Router Advertisement)
+  ansible.builtin.command:
+    cmd: "ip -6 route show default"
+  register: verify_ipv6_default_route
+  changed_when: false
+  failed_when: false
+  when: router_enable_ipv6
+
+################################################################################
+# IP Forwarding (both address families)
+################################################################################
+- name: Verify IPv4 forwarding is enabled
+  ansible.builtin.command:
+    cmd: "sysctl -n net.ipv4.ip_forward"
+  register: verify_ip_forward
+  changed_when: false
+  failed_when: verify_ip_forward.stdout | trim != '1'
+
+# Forgetting this one is the classic "dual-stack router that only routes IPv4".
+- name: Verify IPv6 forwarding is enabled
+  ansible.builtin.command:
+    cmd: "sysctl -n net.ipv6.conf.all.forwarding"
+  register: verify_ip6_forward
+  changed_when: false
+  failed_when: verify_ip6_forward.stdout | trim != '1'
+  when: router_enable_ipv6

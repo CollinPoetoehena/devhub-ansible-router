@@ -1,298 +1,468 @@
 ---
-# firewall.yml — Configure iptables for NAT, forwarding, and security rules.
+# firewall.yml — Firewall, NAT and security rules for the lab router (nftables).
 #
-# This task file sets up the firewall rules that make the Pi function as a
-# proper router with network address translation (NAT) and security isolation.
+################################################################################
+# What this file does, and what it deliberately does NOT do
+################################################################################
+# This file is the DEPLOYMENT LOGIC for the firewall. It installs nftables,
+# removes the legacy firewall stacks, creates the include directory and copies
+# the rule templates into place.
 #
-# What NAT (Network Address Translation) does:
-#   Lab devices have private IPs (10.42.0.0/20) that are not routable on the
-#   internet or even on the home network. NAT (specifically MASQUERADE) rewrites
-#   the source IP of outgoing packets from lab devices to the Pi's WAN IP
-#   (e.g. 192.168.2.x). This makes it look like all lab traffic comes from the Pi
-#   itself, allowing lab devices to access the internet through the ISP modem.
-#   Return traffic is automatically translated back to the original lab device IP.
+# It contains no firewall rules itself. Every actual rule lives in a Jinja2
+# template under templates/nftables/ and is rendered into a numbered fragment
+# in {{ router_nftables_include_dir }}:
 #
-# What the FORWARD chain does:
-#   The FORWARD chain controls which packets are allowed to pass THROUGH the Pi
-#   (from one interface to another). Without explicit FORWARD rules, the kernel
-#   drops forwarded packets even if ip_forward is enabled, because the default
-#   policy is typically DROP or the chain is empty.
+#   nftables.conf.j2   -> /etc/nftables.conf              flush + include, nothing else
+#   10-base.nft.j2     -> /etc/nftables.d/10-base.nft     defines, tables, chains, policies
+#   20-nat.nft.j2      -> /etc/nftables.d/20-nat.nft      NAT / masquerading (v4 + optional NAT66)
+#   30-default.nft.j2  -> /etc/nftables.d/30-default.nft  baseline rules (conntrack, ICMPv6, hard denies)
+#   40-dynamic.nft.j2  -> /etc/nftables.d/40-dynamic.nft  per-VLAN rules generated from router_vlans
 #
-# Security isolation (lab → home blocking):
-#   Even though NAT allows lab devices to reach the internet, we add explicit
-#   rules to BLOCK lab devices from reaching the HOME network (e.g. 192.168.2.0/24).
+# WHY the rules live in the templates instead of in this task file:
 #
-# Inter-VLAN isolation:
-#   By default, inter-VLAN traffic is allowed (the router forwards between all
-#   VLAN sub-interfaces). Specific rules block dangerous flows, e.g. IoT → Management.
+#   1. Rule ORDER is policy. nftables evaluates a chain top to bottom and the
+#      first verdict wins, so "block lab -> home" MUST be evaluated before any
+#      per-VLAN allow. Expressing that as a sequence of Ansible tasks means the
+#      security model depends on task order, which is invisible when reading
+#      the resulting firewall. In the templates the order is literally the
+#      order of the lines, and the numeric file prefixes make the order between
+#      concerns explicit (10 -> 20 -> 30 -> 40), such as 10-base.nft.j2 before 20-nat.nft.j2.
 #
-# Rule order matters! iptables processes rules top-to-bottom and stops at the
-# first match. The blocking rule for home network traffic must come BEFORE the
-# general allow rule for internet traffic.
+#   2. Atomicity. `nft -f` applies a complete ruleset in ONE transaction:
+#      either all of it becomes active or none of it does. Adding rules one
+#      Ansible task at a time (the old ansible.builtin.iptables approach) means
+#      a playbook that fails halfway leaves a half-open firewall behind.
+#
+#   3. Reviewability. `nft list ruleset` on the router and the rendered fragments
+#      in git look the same. There is no mental translation between "what
+#      Ansible did" and "what the kernel enforces".
+#
+#   4. Data-driven policy. 40-dynamic.nft.j2 generates every per-VLAN rule from
+#      router_vlans[].firewall, so adding a VLAN or opening a port is a change
+#      in group_vars/router/main.yml only — never an edit to a task or a
+#      hand-written rule. See roles/router/defaults/main.yml for the schema.
+#
+# So: this file decides WHICH fragments exist and WHEN they are (re)deployed;
+# the templates (the <number>-<name>.nft.j2 files) decide WHAT the firewall actually is.
+#
+################################################################################
+# nftables vs iptables vs ufw — why this role uses nftables
+################################################################################
+# All three manage the SAME kernel subsystem (netfilter). They are not three
+# firewalls; they are three interfaces to one firewall.
+#
+# iptables (legacy)
+#   - The classic userspace tool. One binary per address family: `iptables`
+#     for IPv4 and `ip6tables` for IPv6, with separate, duplicated rule sets.
+#   - Rules are added one at a time. There is no transaction: a playbook that
+#     fails halfway leaves the router in a half-configured state.
+#   - Matching on multiple ports/addresses means either many rules or the
+#     `multiport`/`ipset` extensions; large rule sets are evaluated linearly.
+#   - On Debian/Raspberry Pi OS today, `iptables` is usually just a
+#     compatibility wrapper (iptables-nft) writing into nftables anyway — so
+#     using it adds a translation layer without adding any capability.
+#   - Persistence needs an extra package (iptables-persistent /
+#     netfilter-persistent) that saves and replays the rules.
+#
+# ufw (Uncomplicated Firewall)
+#   - Not a firewall: a simplifying FRONTEND that generates iptables/nftables
+#     rules for you (`ufw allow from 192.168.2.0/24 to any port 22`).
+#   - Excellent for a single-homed host where the only question is "which
+#     inbound ports are open".
+#   - A poor fit for a ROUTER: ufw's model is host-centric. NAT, per-interface
+#     forwarding, inter-VLAN policy and IPv6 prefix rules all end up in
+#     /etc/ufw/before.rules as hand-written raw iptables anyway, so you get
+#     ufw's abstraction AND raw rules, in two different syntaxes, with ufw's
+#     own chains interleaved. Debugging that is worse than writing the rules
+#     directly.
+#
+# nftables (chosen)
+#   - The modern, native netfilter interface; the successor to iptables and
+#     the default on Debian-based systems since Debian 10.
+#   - ONE ruleset for IPv4 and IPv6 via the `inet` family. This matters a lot
+#     now that the lab is dual-stack: a single rule covers both instead of
+#     maintaining iptables and ip6tables rules that inevitably drift apart.
+#   - Atomic loading, declarative files under version control, native sets and
+#     counters, and built-in persistence via nftables.service.
+#
+# Summary of the choice for this homelab:
+#   Lab ROUTER (this role)  -> nftables (NAT, forwarding, VLAN policy, dual-stack)
+#   Simple single-host VMs  -> ufw is perfectly fine, and easier for teammates
+#   Raw iptables            -> avoided for new work; kept only as a debugging
+#                              vocabulary and for reading old documentation
+#
+# CRITICAL: never run two of these at the same time. iptables(-nft), ufw and
+# nftables all inject rules into netfilter independently, so a packet can be
+# accepted by one rule set and dropped by another, with no single place to see
+# why. The tasks below therefore actively remove the legacy stacks.
+################################################################################
 
 ################################################################################
-# Derived variables
+# Install nftables
 ################################################################################
-# iptables "-i eth1+" matches the physical interface AND all VLAN sub-interfaces
-# (eth1.10, eth1.20, eth1.30). The "+" is an iptables wildcard meaning "any
-# interface whose name starts with this prefix". This lets us write one rule
-# that covers all VLANs instead of duplicating per sub-interface.
-- name: Set LAN wildcard interface for iptables rules
-  ansible.builtin.set_fact:
-    router_lan_wildcard: "{{ router_lan_interface }}+"
-
-################################################################################
-# Install iptables and persistence tooling
-################################################################################
-
-- name: Install iptables and iptables-persistent
+# Installed here rather than in packages.yml so that `--tags firewall` is
+# self-contained and can be run on its own.
+- name: Install nftables
   ansible.builtin.apt:
-    name:
-      - iptables
-      - iptables-persistent
+    name: nftables
     state: present
     update_cache: true
-  # iptables-persistent asks interactive questions during install about saving
-  # current rules. Pre-seed the answers to avoid blocking the playbook.
-  environment:
-    DEBIAN_FRONTEND: noninteractive
 
-# Pre-seed debconf answers for iptables-persistent so it does not prompt
-# during installation. This tells it to save current rules automatically.
-- name: Pre-seed iptables-persistent debconf answers
-  ansible.builtin.debconf:
-    name: iptables-persistent
-    question: "{{ item }}"
-    value: "true"
-    vtype: boolean
+################################################################################
+# Cleanup task: Remove the legacy firewall stacks (iptables-persistent and ufw)
+################################################################################
+# This role previously used iptables + iptables-persistent. Leaving those
+# installed means /etc/iptables/rules.v4 is replayed at boot ON TOP of the
+# nftables ruleset, producing exactly the double-rule-set confusion described
+# above. The same applies to ufw if it was ever enabled on the router.
+
+- name: Check whether ufw is installed
+  ansible.builtin.stat:
+    path: /usr/sbin/ufw
+  register: router_ufw_binary
+
+- name: Disable ufw if it is present (nftables is authoritative on this host)
+  ansible.builtin.command:
+    cmd: ufw --force disable
+  when:
+    - router_remove_legacy_iptables
+    - router_ufw_binary.stat.exists
+  changed_when: true
+
+- name: Stop and disable netfilter-persistent (legacy iptables replay at boot)
+  ansible.builtin.systemd:
+    name: netfilter-persistent
+    state: stopped
+    enabled: false
+  when: router_remove_legacy_iptables
+  failed_when: false
+
+- name: Remove legacy iptables persistence packages
+  ansible.builtin.apt:
+    name:
+      - iptables-persistent
+      - netfilter-persistent
+      - ufw
+    state: absent
+    purge: true
+  when: router_remove_legacy_iptables
+
+- name: Remove leftover iptables rule files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
   loop:
-    - iptables-persistent/autosave_v4
-    - iptables-persistent/autosave_v6
+    - /etc/iptables/rules.v4
+    - /etc/iptables/rules.v6
+  when: router_remove_legacy_iptables
+
+# Flush anything still loaded in the legacy tables in the RUNNING kernel.
+# Without this, rules added by a previous run of this role stay active until
+# the next reboot, even though the packages are gone.
+- name: Flush any remaining legacy iptables rules from the running kernel
+  ansible.builtin.shell: |
+    set -e
+    for bin in iptables ip6tables; do
+      if command -v "$bin" >/dev/null 2>&1; then
+        "$bin" -F || true
+        "$bin" -X || true
+        "$bin" -t nat -F || true
+        "$bin" -t nat -X || true
+        "$bin" -P INPUT ACCEPT || true
+        "$bin" -P FORWARD ACCEPT || true
+        "$bin" -P OUTPUT ACCEPT || true
+      fi
+    done
+  args:
+    executable: /bin/bash
+  when: router_remove_legacy_iptables
+  changed_when: true
+  # The policies are set back to ACCEPT on purpose: the nftables ruleset
+  # deployed below is what actually enforces policy, and leaving a legacy chain
+  # at DROP would silently block traffic that nftables allows.
 
 ################################################################################
-# NAT (Masquerading) — Allow lab devices to reach the internet
+# Main nftables configuration file (flush + include)
 ################################################################################
-# MASQUERADE in the POSTROUTING chain of the nat table rewrites the source IP
-# of packets leaving via eth0 (WAN) to the Pi's own WAN IP. This is what
-# enables internet access for all lab devices behind the router.
+# /etc/nftables.conf is what nftables.service loads at boot. It contains no
+# rules itself: it flushes the ruleset and includes the numbered fragments, so
+# that a reload is always a full, atomic replacement rather than an append.
+
+- name: Ensure nftables include directory exists
+  ansible.builtin.file:
+    path: "{{ router_nftables_include_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750" # Firewall policy is not world-readable
+
+- name: Deploy main nftables configuration (flush + include fragments)
+  ansible.builtin.template:
+    src: nftables/nftables.conf.j2
+    dest: "{{ router_nftables_main_config }}"
+    owner: root
+    group: root
+    mode: "0750" # nftables.conf is executable-by-root style on Debian
+    backup: true
+  notify: Reload nftables
+
+################################################################################
+# Fragment 10 — base tables, chains, hooks and default policies
+################################################################################
+# The SKELETON of the firewall:
+#   - table inet filter  -> input / forward / output chains (packet filtering)
+#   - table inet nat     -> prerouting / postrouting chains (address translation)
+#
+# WHY the `inet` family instead of separate `ip` (IPv4) and `ip6` (IPv6)
+# tables: `inet` is a dual-stack family, so one rule covers both address
+# families. With iptables this required maintaining a parallel ip6tables rule
+# set by hand — the single most common reason an "IPv6-enabled" router ends up
+# with an IPv4-only firewall. Now that this lab is dual-stack, that would be a
+# real security hole, not a theoretical one.
+#
+# WHY default policy DROP on input and forward:
+#   - There is no NAT in IPv6 to accidentally hide the lab behind, so the
+#     firewall is the only thing standing between a lab device and the
+#     internet. Default-deny is the only defensible choice.
+#   - It also makes the configuration self-documenting: if a flow works, there
+#     is a rule for it somewhere in 30-default.nft or 40-dynamic.nft.
+#
+# WHY policy ACCEPT on output: the router is a trusted device that we manage;
+# filtering its own outbound traffic adds maintenance cost (apt, DNS, NTP, RA)
+# without meaningfully improving the security of the lab.
+- name: Deploy base nftables tables, chains and default policies
+  ansible.builtin.template:
+    src: nftables/10-base.nft.j2
+    dest: "{{ router_nftables_include_dir }}/10-base.nft"
+    owner: root
+    group: root
+    mode: "0640"
+    backup: true
+  notify: Reload nftables
+
+################################################################################
+# Fragment 20 — NAT (masquerading)
+################################################################################
+# What NAT (Network Address Translation) does:
+#   Lab devices have private IPs (e.g. 10.42.0.0/20) that are not routable on the
+#   internet or even on the home network. NAT (specifically MASQUERADE) rewrites
+#   the source IP of outgoing packets from lab devices to the router's WAN IP
+#   (e.g. 192.168.2.x). This makes it look like all lab traffic comes from the router
+#   itself, allowing lab devices to access the internet through the ISP modem.
+#   Return traffic is automatically translated back to the original lab device IP
+#   by the connection tracking (conntrack) subsystem.
 #
 # Why MASQUERADE instead of SNAT?
 #   MASQUERADE automatically uses whatever IP is currently assigned to the
 #   outgoing interface (eth0). Since eth0 gets its IP via DHCP from the ISP
 #   modem (and it could theoretically change), MASQUERADE adapts automatically.
 #   SNAT requires a hard-coded IP and would break if the DHCP lease changes.
-
-- name: Configure NAT (MASQUERADE) on WAN interface
-  ansible.builtin.iptables:
-    table: nat # The "nat" table handles address translation (separate from the default "filter" table)
-    chain: POSTROUTING # POSTROUTING = after routing decision, just before packet leaves the interface
-    out_interface: "{{ router_wan_interface }}" # Only rewrite packets exiting via WAN (eth0)
-    jump: MASQUERADE # Replace source IP with the WAN interface's current IP
-    comment: "NAT: masquerade lab traffic going out to internet via WAN"
-  when: router_enable_nat
-  notify: Save iptables rules
-
-################################################################################
-# FORWARD chain — Control traffic flow between interfaces
-################################################################################
-# These rules define what traffic is allowed to pass through the Pi (be routed
-# from one interface to another).
-
-# RULE 1: Block lab → home network (MUST come before the general allow rule!)
-# This prevents any lab device from initiating connections to the home network.
-# Even though the Pi does NAT, without this rule a lab device could potentially
-# reach home devices if the ISP modem routes 10.42.x.x traffic back.
-# This is defense-in-depth: even if something goes wrong with NAT or routing,
-# the firewall explicitly blocks this traffic.
-- name: Block lab network from reaching home network
-  ansible.builtin.iptables:
-    chain: FORWARD # FORWARD = packets passing THROUGH the router (not destined for the router itself)
-    in_interface: "{{ router_lan_wildcard }}" # Match traffic arriving from any lab VLAN
-    destination: "{{ router_home_subnet }}" # Headed for the home network
-    jump: DROP # Silently discard — no response sent back
-    comment: "SECURITY: block lab devices from reaching home network"
-  when: router_block_lab_to_home
-  notify: Save iptables rules
-
-# RULE 2: Allow lab → internet (outbound from LAN to WAN)
-# This allows lab devices to initiate connections to the internet (any
-# destination that is NOT the home network, since that's blocked above).
-- name: Allow forwarding from LAN to WAN (lab → internet)
-  ansible.builtin.iptables:
-    chain: FORWARD # Packets passing through the router
-    in_interface: "{{ router_lan_wildcard }}" # From any lab VLAN
-    out_interface: "{{ router_wan_interface }}" # Heading to the internet via WAN
-    jump: ACCEPT # Allow the packet through
-    comment: "Allow lab devices to reach the internet via WAN"
-  notify: Save iptables rules
-
-################################################################################
-# RULE 3 + RULE 3b — WAN → LAN/VLAN return traffic handling and WAN isolation
 #
-# These two rules together define how the router handles traffic coming *from*
-# the WAN (home network) toward the LAN/VLANs (lab network). They ensure that:
-#   1. Lab devices can receive return traffic from the internet (ESTABLISHED,
-#      RELATED connections only).
-#   2. The router NEVER forwards any *new* traffic from the home network into
-#      the lab VLANs — providing strong isolation and preventing accidental
-#      disruption of the home network.
+# IPv6 and NAT66:
+#   Normally IPv6 needs no NAT at all — every device gets a globally routable
+#   address. That is only true if the upstream router DELEGATES a prefix to us.
+#   A consumer ISP modem usually does not delegate a usable prefix downstream,
+#   so the lab uses stable ULA addressing (fd42::/48) and masquerades IPv6
+#   egress to the WAN address, controlled by router_enable_ipv6_nat.
+#   This is a pragmatic lab compromise, NOT a pattern to copy into production:
+#   NAT66 breaks end-to-end addressing, complicates logging and defeats one of
+#   the main points of IPv6. Turn it off as soon as prefix delegation works.
 #
-# Why this matters:
-#   - Linux forwarding is global (ip_forward=1), so iptables must enforce
-#     interface-level forwarding rules.
-#   - Without RULE 3, lab devices could reach the internet but never receive
-#     responses.
-#   - Without RULE 3b, future firewall changes could accidentally allow WAN →
-#     LAN/VLAN forwarding, which risks: DHCP conflicts, ARP pollution, Broadcast storms,
-#     Routing loops, NAT misfires, Accidental bridging between home and lab networks, etc.
+# NOTE: NAT makes traffic *possible*; it does not make it *allowed*. The
+# forward chain still has a default policy of DROP, so a packet must ALSO match
+# an accept rule in 30-default.nft or 40-dynamic.nft to actually pass.
+- name: Deploy NAT (masquerade) nftables rules
+  ansible.builtin.template:
+    src: nftables/20-nat.nft.j2
+    dest: "{{ router_nftables_include_dir }}/20-nat.nft"
+    owner: root
+    group: root
+    mode: "0640"
+    backup: true
+  notify: Reload nftables
+
+################################################################################
+# Fragment 30 — default (static baseline) rules
+################################################################################
+# The rules that do not depend on how many VLANs exist or what their policy is.
+# They cover four things:
 #
-# Together, these rules form a hard safety barrier:
-#   - LAN/VLAN → WAN is allowed (internet access)
-#   - WAN → LAN/VLAN is allowed ONLY for ESTABLISHED/RELATED return traffic
-#   - All NEW WAN → LAN/VLAN forwarding is explicitly blocked
+#   1. Stateful plumbing
+#      conntrack established/related accept, invalid drop, loopback accept.
+#      Without these, the default DROP policy would break literally everything,
+#      including the router's own apt updates.
 #
-# This guarantees the Pi router cannot disrupt home WiFi, home DHCP, or home
-# routing — even if NetworkManager or iptables rules are modified later.
-################################################################################
-# RULE 3: Allow return traffic (WAN → LAN for established connections)
-# This allows response packets from the internet back to lab devices, but ONLY
-# for connections that were initiated from the lab side (RELATED,ESTABLISHED).
-- name: Allow return traffic from WAN to LAN (established/related connections only)
-  ansible.builtin.iptables:
-    chain: FORWARD
-    in_interface: "{{ router_wan_interface }}"    # Traffic entering from WAN (home network)
-    out_interface: "{{ router_lan_wildcard }}"    # Any lab VLAN (eth1+ wildcard)
-    ctstate: # conntrack state — only allow packets belonging to
-      - ESTABLISHED # an existing connection (response to outbound request)
-      - RELATED # or related to one (e.g. ICMP error for an active conn)
-    jump: ACCEPT
-    comment: "Allow return traffic for connections initiated by lab devices"
-  notify: Save iptables rules
-# RULE 3b: Explicitly block any NEW forwarding from WAN → LAN/VLANs
-- name: Explicitly block WAN → LAN/VLAN forwarding
-  ansible.builtin.iptables:
-    chain: FORWARD
-    in_interface: "{{ router_wan_interface }}"     # Traffic entering from WAN (home network)
-    out_interface: "{{ router_lan_wildcard }}"     # Any lab VLAN (eth1+ wildcard)
-    jump: DROP                                     # Block NEW forwarding attempts
-    comment: "SECURITY: explicitly block WAN → LAN/VLAN forwarding (defense-in-depth)"
-  notify: Save iptables rules
-
-# RULE 4: Allow inter-VLAN forwarding (traffic between VLAN sub-interfaces)
-# The router forwards between all VLANs by default. Specific deny rules below
-# restrict dangerous flows (e.g. IoT → Management).
-- name: Allow inter-VLAN forwarding
-  ansible.builtin.iptables:
-    chain: FORWARD
-    in_interface: "{{ router_lan_wildcard }}" # From any lab VLAN sub-interface
-    out_interface: "{{ router_lan_wildcard }}" # To any lab VLAN sub-interface
-    jump: ACCEPT
-    comment: "Allow inter-VLAN routing between lab VLANs"
-  notify: Save iptables rules
-
-# TODO: Add specific inter-VLAN deny rules once IoT VLAN is populated, e.g.:
-#   - Block IoT (eth1.30) → Management (eth1.10)
-#   - Allow IoT (eth1.30) → Services (eth1.20) for sensor data
+#   2. ICMP and — critically — ICMPv6
+#      Blocking ICMPv6 does not "harden" an IPv6 network, it BREAKS it.
+#      Neighbour Discovery (the IPv6 replacement for ARP), Router
+#      Advertisements, and Path MTU Discovery all ride on ICMPv6. The rules
+#      allow the required types explicitly.
+#
+#   3. Hard security boundaries (defence in depth)
+#      - lab -> home network is dropped, in both address families
+#      - WAN -> LAN forwarding of NEW connections is dropped
+#      These are deliberately placed BEFORE any per-VLAN allow rule, because
+#      nftables evaluates a chain top to bottom and the first verdict wins.
+#      This is why they live in 30-default.nft and the generated per-VLAN
+#      rules live in 40-dynamic.nft.
+#
+#   4. Router management access
+#      SSH from the WAN side (the home network) so the router stays reachable as a
+#      jumphost. Per-VLAN service access (DNS, DHCP, NTP, ...) is generated in
+#      fragment 40 instead, so that each VLAN only gets what its policy says it
+#      may have.
+#
+# IMPORTANT ordering note for the WAN side:
+#   "WAN -> LAN established/related accept" must come BEFORE "WAN -> LAN drop",
+#   otherwise return traffic for lab-initiated connections is killed and the
+#   lab has no internet at all. The generic conntrack accept at the top of the
+#   forward chain already covers this; the explicit drop that follows then only
+#   affects NEW inbound connections. That is the whole trick.
+- name: Deploy default (baseline) nftables rules
+  ansible.builtin.template:
+    src: nftables/30-default.nft.j2
+    dest: "{{ router_nftables_include_dir }}/30-default.nft"
+    owner: root
+    group: root
+    mode: "0640"
+    backup: true
+  notify: Reload nftables
 
 ################################################################################
-# INPUT chain — Protect the router itself
+# Fragment 40 — dynamic per-VLAN rules (generated from router_vlans)
 ################################################################################
-# INPUT controls traffic destined for the Pi itself (its own services: SSH,
-# DNS, DHCP). This is separate from FORWARD which handles traffic passing
-# through the router to other networks.
+# Every rule in this fragment is DERIVED FROM DATA. Adding a VLAN, opening a
+# port, or isolating two networks is a change in group_vars/router/main.yml —
+# never a change to this task file or a hand-written rule.
+#
+# Supported per-VLAN policy (see roles/router/defaults/main.yml for the full
+# schema documentation):
+#
+#   firewall:
+#     allow_to_internet: true            # forward VLAN -> WAN
+#     router_services: [ssh, dns, dhcp, icmp, ntp]
+#                                        # what the VLAN may use ON the router
+#     inter_vlan:                        # VLAN -> VLAN policy
+#       - { action: allow, to: 20, proto: tcp, ports: [1883, 8123] }
+#       - { action: drop,  to: 10 }
+#     custom:                            # anything the shortcuts do not cover
+#       - { action: allow, chain: input, proto: tcp, ports: [9100],
+#           saddr: "10.42.10.0/24", family: ip, comment: "node exporter" }
+#
+# Anything not matched by a generated rule falls through to
+# router_inter_vlan_default_policy (for VLAN -> VLAN) and ultimately to the
+# chain's default DROP policy.
+#
+# Dual-stack: each generated rule is emitted for both address families where it
+# makes sense. Interface-based rules (iifname/oifname) are family-agnostic in
+# the `inet` table and therefore written once; address-based rules are emitted
+# per family using the VLAN's `subnet` (IPv4) and `subnet6` (IPv6) values.
+#
+# Rule ORDER inside this fragment (top to bottom, because first match wins):
+#   1. per-VLAN drop/reject rules   -> explicit denies always beat allows
+#   2. per-VLAN inter-VLAN allows
+#   3. per-VLAN internet access
+#   4. per-VLAN router service access (input chain)
+#   5. per-VLAN custom rules
+#   6. inter-VLAN default policy
 
-# Allow all traffic on loopback (required for local services to communicate)
-- name: Allow loopback traffic
-  ansible.builtin.iptables:
-    chain: INPUT # Packets destined for the router itself
-    in_interface: lo # Loopback interface (127.0.0.1)
-    jump: ACCEPT
-    comment: "Allow loopback traffic (required for local services)"
-  notify: Save iptables rules
+- name: Validate per-VLAN firewall policy before rendering rules
+  ansible.builtin.assert:
+    that:
+      - item.firewall is not defined or item.firewall is mapping
+      - >-
+        item.firewall is not defined or
+        item.firewall.inter_vlan is not defined or
+        (item.firewall.inter_vlan | map(attribute='to') | list) is subset(router_vlans | map(attribute='id') | list)
+    fail_msg: >-
+      VLAN {{ item.id }} ({{ item.name }}) has an invalid firewall policy:
+      `firewall` must be a dict and every inter_vlan `to:` must reference an
+      existing VLAN id from router_vlans.
+    quiet: true
+  loop: "{{ router_vlans }}"
+  loop_control:
+    label: "vlan{{ item.id }} ({{ item.name }})"
+  # Catching this here gives a readable error instead of an `nft -f` syntax
+  # failure that points at a generated file nobody wrote by hand.
 
-# Allow established/related traffic to the router itself (responses to
-# outgoing connections the Pi initiated, e.g. apt updates, DNS queries)
-- name: Allow established/related traffic to router
-  ansible.builtin.iptables:
-    chain: INPUT
-    ctstate:
-      - ESTABLISHED
-      - RELATED
-    jump: ACCEPT
-    comment: "Allow return traffic for router's own connections"
-  notify: Save iptables rules
-
-# Allow SSH from LAN side (so you can manage the router from lab devices)
-- name: Allow SSH from LAN
-  ansible.builtin.iptables:
-    chain: INPUT
-    in_interface: "{{ router_lan_wildcard }}" # From any lab VLAN
-    protocol: tcp # SSH uses TCP
-    destination_port: "22" # Standard SSH port
-    jump: ACCEPT
-    comment: "Allow SSH access from lab network"
-  notify: Save iptables rules
-
-# Allow SSH from WAN side (so you can manage the router from home network/laptop)
-- name: Allow SSH from WAN
-  ansible.builtin.iptables:
-    chain: INPUT
-    in_interface: "{{ router_wan_interface }}" # From the home network side
-    protocol: tcp
-    destination_port: "22"
-    jump: ACCEPT
-    comment: "Allow SSH access from home network"
-  notify: Save iptables rules
-
-# Allow DHCP requests on LAN (lab devices requesting IP addresses)
-- name: Allow DHCP on LAN interface
-  ansible.builtin.iptables:
-    chain: INPUT
-    in_interface: "{{ router_lan_wildcard }}"
-    protocol: udp # DHCP uses UDP
-    destination_port: "67" # Port 67 = DHCP server; clients send from port 68
-    jump: ACCEPT
-    comment: "Allow DHCP requests from lab devices"
-  notify: Save iptables rules
-
-# Allow DNS queries on LAN (lab devices resolving domain names via dnsmasq)
-- name: Allow DNS (UDP) on LAN interface
-  ansible.builtin.iptables:
-    chain: INPUT
-    in_interface: "{{ router_lan_wildcard }}"
-    protocol: udp
-    destination_port: "53" # DNS uses port 53 for both UDP (most queries) and TCP (zone transfers, large responses)
-    jump: ACCEPT
-    comment: "Allow DNS queries (UDP) from lab devices"
-  notify: Save iptables rules
-
-- name: Allow DNS (TCP) on LAN interface
-  ansible.builtin.iptables:
-    chain: INPUT
-    in_interface: "{{ router_lan_wildcard }}"
-    protocol: tcp
-    destination_port: "53"
-    jump: ACCEPT
-    comment: "Allow DNS queries (TCP) from lab devices"
-  notify: Save iptables rules
-
-# Allow ICMP (ping) — useful for network troubleshooting and monitoring
-- name: Allow ICMP (ping) from anywhere
-  ansible.builtin.iptables:
-    chain: INPUT
-    protocol: icmp # ICMP = Internet Control Message Protocol (ping, traceroute, etc.)
-    jump: ACCEPT
-    comment: "Allow ping for network troubleshooting"
-  notify: Save iptables rules
+- name: Deploy dynamic per-VLAN nftables rules
+  ansible.builtin.template:
+    src: nftables/40-dynamic.nft.j2
+    dest: "{{ router_nftables_include_dir }}/40-dynamic.nft"
+    owner: root
+    group: root
+    mode: "0640"
+    backup: true
+  notify: Reload nftables
 
 ################################################################################
-# Save rules for persistence across reboots
+# Remove stale fragments
 ################################################################################
-# iptables rules are stored in memory and lost on reboot unless explicitly saved.
-# netfilter-persistent saves them to /etc/iptables/rules.v4 and loads them at boot.
+# If a fragment is renamed or dropped from the role, the old file would keep
+# being included (and its rules enforced) forever. Clean up anything in the
+# include directory that this role did not just write.
 
-- name: Save iptables rules to persist across reboots
+- name: Find existing nftables fragments
+  ansible.builtin.find:
+    paths: "{{ router_nftables_include_dir }}"
+    patterns: "*.nft"
+  register: router_nft_existing_fragments
+
+- name: Remove nftables fragments that are no longer managed by this role
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ router_nft_existing_fragments.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  when: item.path | basename not in ['10-base.nft', '20-nat.nft', '30-default.nft', '40-dynamic.nft']
+  notify: Reload nftables
+
+################################################################################
+# Validate and persist the ruleset
+################################################################################
+# Persistence with nftables is much simpler than with iptables:
+#   iptables: rules live only in kernel memory; an extra package
+#             (iptables-persistent) has to dump them to /etc/iptables/rules.v4
+#             and replay them at boot. Save and load are separate concepts, so
+#             the saved file can silently drift from what is actually running.
+#   nftables: /etc/nftables.conf IS the configuration. nftables.service loads
+#             it at boot with a single atomic `nft -f`. There is nothing to
+#             "save": the files under version control are the source of truth,
+#             and a reload simply re-applies them.
+#
+# The check below (`nft -c -f`) parses and validates the complete ruleset
+# WITHOUT applying it. This is the nftables equivalent of a dry run and there
+# is no iptables counterpart — with iptables a typo is only discovered when the
+# rule is already half-applied.
+
+- name: Validate the complete nftables ruleset (dry run, nothing is applied)
   ansible.builtin.command:
-    cmd: netfilter-persistent save
+    cmd: "nft --check --file {{ router_nftables_main_config }}"
+  changed_when: false
+  # If this fails the playbook stops BEFORE the reload handler runs, so a
+  # broken ruleset can never be loaded onto the router.
+
+- name: Ensure nftables service is enabled and started
+  ansible.builtin.systemd:
+    name: nftables
+    state: started
+    enabled: "{{ router_nftables_persistent }}"
+    daemon_reload: true
+
+# Safety net for the very first run: the handler that reloads nftables only
+# fires when a template changed. On a host where the files already match but
+# the kernel ruleset is empty (e.g. after a manual `nft flush ruleset`), load
+# it explicitly.
+- name: Check whether the filter table is present in the running ruleset
+  ansible.builtin.command:
+    cmd: "nft list table inet filter"
+  register: router_nft_running
+  changed_when: false
+  failed_when: false
+
+- name: Load the nftables ruleset if it is not currently active
+  ansible.builtin.command:
+    cmd: "nft --file {{ router_nftables_main_config }}"
+  when: router_nft_running.rc != 0
   changed_when: true
-  when: router_iptables_persistent
