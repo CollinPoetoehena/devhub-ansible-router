@@ -1,10 +1,23 @@
-# devhub-ansible-router
+# devhub-ansible-router-custom
 
 > Part of [DevHub/Ansible](https://github.com/CollinPoetoehena/DevHub/blob/main/packages/Ansible.md) — see that file for conventions, structure guidelines, and the full role index.
 
 Configures a Debian-based system (e.g. Raspberry Pi) as a dedicated lab router providing network isolation, DHCP, DNS, SLAAC/Router Advertisements, NAT and an nftables firewall (e.g. for a homelab). The lab is **dual-stack (IPv4 + IPv6)**. 
 
 Primarily used for my personal [homelab in DevHub](https://github.com/CollinPoetoehena/DevHub/blob/main/homelab/README.md) but also suitable for other small-scale lab environments.
+
+## IMPORTANT: Archive Note
+> **Archive note (2026-10):** This role is no longer actively maintained and is kept for historical reference. It was originally developed for my personal homelab as a way to learn Linux networking, routing, firewalling, DNS, DHCP, VLANs, and infrastructure automation in a hands-on manner. The role managed a Debian-based router (like a Raspberry Pi) and its associated network services through Ansible, including nftables firewall rules, dnsmasq configuration, routing, network segmentation, and integration with the broader homelab environment.
+>
+> At the time, this approach aligned well with my goals. Building and managing the router entirely through custom Ansible playbooks provided valuable experience with low-level networking concepts and offered a deeper understanding of how dedicated router platforms operate under the hood. It also enabled full infrastructure-as-code workflows, version control, reproducibility, and extensive customization.
+>
+> However, maintaining a general-purpose Linux system as a router requires a significant amount of operational effort. Beyond implementing the initial configuration, ongoing management involves maintaining the operating system, monitoring package and kernel updates, troubleshooting networking issues, debugging firewall behavior, validating routing changes, managing service updates, and continuously ensuring that DNS, DHCP, VLAN, and switch configurations remain consistent and functional. While these activities are excellent learning opportunities, they consume considerable time and attention compared to purpose-built networking platforms.
+>
+> As my [homelab](https://github.com/CollinPoetoehena/DevHub/blob/main/homelab/README.md) matured, the router gradually transitioned from being a learning project into a piece of infrastructure that I expected to be stable, reliable, and largely maintenance-free. At that stage, continuing to manage every aspect of the router manually no longer provided sufficient value relative to the time invested. Rather than spending time on routine network maintenance and troubleshooting, I preferred to focus on other areas of the homelab, such as virtualization, Kubernetes, platform engineering, observability, automation, self-hosted services, and higher-level network architecture.
+>
+> For this reason, I eventually migrated to a dedicated router operating system, such as OpenWrt or pfSense, combined with a managed switch for VLAN and network segmentation. Dedicated router platforms provide a mature networking stack, integrated management interfaces, streamlined upgrades, extensive community support, and features that would otherwise require significant custom implementation and ongoing maintenance. They also offer a more appliance-like operational model, allowing the router and switch infrastructure to remain reliable and predictable while still supporting automation where desired.
+>
+> Consequently, this role has been archived and is no longer maintained. It remains available as a reference for those interested in learning networking fundamentals, Linux-based routing, firewall management, and infrastructure-as-code practices. For production-like homelab environments where stability, reliability, and reduced operational overhead are the primary goals, I now recommend using a dedicated router operating system together with managed switching rather than maintaining a custom Linux router through Ansible alone.
 
 ## What This Role Does
 
@@ -158,7 +171,7 @@ Requirements file example (same directory as ansible.cfg, create a file called r
 ---
 roles:
   - name: devhub.router
-    src: https://github.com/CollinPoetoehena/devhub-ansible-router.git
+    src: https://github.com/CollinPoetoehena/devhub-ansible-router-custom.git
     scm: git
     version: 1.0.0
 ``` 

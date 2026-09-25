@@ -1,5 +1,5 @@
 ---
-# defaults file for devhub-ansible-router
+# defaults file for devhub-ansible-router-custom
 #
 # Generic defaults that work for any deployment. Site-specific values
 # (network addressing, home subnet, DHCP range, per-VLAN firewall policy)

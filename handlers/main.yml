@@ -1,5 +1,5 @@
 ---
-# handlers file for devhub-ansible-router
+# handlers file for devhub-ansible-router-custom
 #
 # Handlers are triggered by "notify" in tasks and run once at the end of the play
 # (or when explicitly flushed). They ensure services are restarted/reloaded only

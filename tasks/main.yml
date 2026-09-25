@@ -1,5 +1,5 @@
 ---
-# tasks file for devhub-ansible-router
+# tasks file for devhub-ansible-router-custom
 #
 # This role configures a Debian-based system (e.g. Raspberry Pi) as a dedicated lab router.
 # It provides:
@@ -39,8 +39,8 @@
   ansible.builtin.import_tasks: firewall.yml
   tags: [firewall, nftables, nat, router]
 
-# Flush handlers before verification so that any pending restarts (e.g. dnsmasq 
-# config change or an nftables reload) are applied first. Without this, verify runs 
+# Flush handlers before verification so that any pending restarts (e.g. dnsmasq
+# config change or an nftables reload) are applied first. Without this, verify runs
 # against the old state and a failure aborts the play before handlers ever fire.
 - name: Flush pending handlers before verification
   ansible.builtin.meta: flush_handlers
